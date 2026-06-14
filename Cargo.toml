@@ -1,0 +1,25 @@
+[package]
+name = "nexis-ml-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Python-free, single-binary ML engine for the Nexis terminal (Phase 3) — same NDJSON protocol and run store as nexis-ml."
+license = "Apache-2.0"
+authors = ["Ryan Wetzstein"]
+repository = "https://github.com/rwetz/nexis-ml-rs"
+
+# The binary is named `nexis-ml` so Nexis detects/spawns it exactly like
+# the Python engine (it matches on the file stem "nexis-ml"); the two are
+# never on PATH together — this one is downloaded to its own dir.
+[[bin]]
+name = "nexis-ml"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
