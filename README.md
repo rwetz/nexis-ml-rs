@@ -21,7 +21,7 @@ downloadable engine for machines without a Python/PyTorch toolchain.
 ```sh
 cargo build --release           # produces target/release/nexis-ml(.exe)
 
-nexis-ml --version              # → "nexis-ml 0.1.0" (Nexis-detectable)
+nexis-ml --version              # → "nexis-ml 0.2.1" (Nexis-detectable)
 nexis-ml env                    # one-line JSON capability report
 nexis-ml new my-run             # scaffold a train.toml
 nexis-ml train my-run           # train; writes .nexis-ml/runs/<id>/
@@ -45,13 +45,19 @@ Same `protocol` version (1), same `metric`/`epoch`/`artifact`/
 `run.finished` events, same `config.json` / `metrics.jsonl` /
 `summary.json` / `artifacts/` layout.
 
+In protocol mode the engine also honors the same stdin **control commands**
+as the Python harness — `{"cmd":"cancel"}` (stop gracefully and finish as
+`cancelled`, keeping the last checkpoint), `{"cmd":"pause"}` /
+`{"cmd":"resume"}` (block/release at the next epoch boundary) — so Nexis's
+Stop and Pause buttons work against either engine.
+
 ## Layout
 
 | File | Role |
 |---|---|
 | `src/protocol.rs` | NDJSON emitter (protocol v1) |
 | `src/run_store.rs` | run directory + atomic file writes (UTC stamp, no deps) |
-| `src/harness.rs` | `Run` lifecycle — ties emitter to the run store |
+| `src/harness.rs` | `Run` lifecycle + stdin control watcher (cancel/pause/resume) |
 | `src/model.rs` | the `train` command's `burn` MLP + CSV/synthetic data |
 | `src/main.rs` | CLI (`--version` / `env` / `new` / `train`) |
 

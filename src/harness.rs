@@ -10,6 +10,9 @@
 //! run.finished) so the event stream and files are interchangeable.
 
 use std::collections::BTreeMap;
+use std::io::BufRead;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use serde_json::json;
 
@@ -21,6 +24,55 @@ struct Stat {
     min: f64,
     max: f64,
     count: u64,
+}
+
+/// Shared run-control flags set by the stdin watcher thread and read by the
+/// training loop. Mirrors the Python harness's cancel/pause Events:
+/// `cancel` makes `run.cancelled()` true (loops break, run finishes as
+/// "cancelled"); `pause` blocks at the next epoch boundary until resume.
+#[derive(Default)]
+struct Control {
+    cancel: AtomicBool,
+    pause: AtomicBool,
+}
+
+impl Control {
+    fn handle(&self, line: &str) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return; // forward-compat: ignore malformed lines, like Python
+        };
+        match v.get("cmd").and_then(|c| c.as_str()) {
+            Some("cancel") => {
+                self.cancel.store(true, Ordering::Relaxed);
+                self.pause.store(false, Ordering::Relaxed); // release a paused loop
+            }
+            Some("pause") => self.pause.store(true, Ordering::Relaxed),
+            Some("resume") => self.pause.store(false, Ordering::Relaxed),
+            _ => {}
+        }
+    }
+}
+
+/// Daemon-style stdin watcher: reads NDJSON control lines
+/// (`{"cmd":"cancel"|"pause"|"resume"}`) and flips the shared flags. The
+/// thread is detached and blocks on stdin; `std::process::exit` tears it
+/// down with the process (Rust's equivalent of Python's daemon thread). On
+/// EOF (Nexis closing the pipe) it simply ends.
+fn start_stdin_watcher(control: Arc<Control>) {
+    let _ = std::thread::Builder::new()
+        .name("nexis-ml-stdin-watcher".into())
+        .spawn(move || {
+            let stdin = std::io::stdin();
+            let mut lock = stdin.lock();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match lock.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => control.handle(line.trim()),
+                }
+            }
+        });
 }
 
 pub struct Run<'a> {
@@ -35,6 +87,7 @@ pub struct Run<'a> {
     stats: BTreeMap<String, Stat>,
     last_values: BTreeMap<String, f64>,
     artifacts: Vec<(String, String)>,
+    control: Arc<Control>,
 }
 
 impl<'a> Run<'a> {
@@ -65,6 +118,12 @@ impl<'a> Run<'a> {
         dir.append_event(&event);
         emitter.emit(event);
         emitter.console(&format!("run {} started", dir.run_id()));
+        // In protocol mode, watch stdin for cancel/pause/resume commands
+        // (a plain terminal uses Ctrl+C instead — see finish-on-cancel below).
+        let control = Arc::new(Control::default());
+        if emitter.enabled() {
+            start_stdin_watcher(Arc::clone(&control));
+        }
         Self {
             name: name.to_string(),
             emitter,
@@ -77,7 +136,29 @@ impl<'a> Run<'a> {
             stats: BTreeMap::new(),
             last_values: BTreeMap::new(),
             artifacts: Vec::new(),
+            control,
         }
+    }
+
+    /// True once a `{"cmd":"cancel"}` command (or hard Ctrl+C upstream) has
+    /// been received. Training loops should check this and break cleanly;
+    /// the already-written checkpoint is preserved.
+    pub fn cancelled(&self) -> bool {
+        self.control.cancel.load(Ordering::Relaxed)
+    }
+
+    /// Block at an epoch boundary while paused, returning on resume or
+    /// cancel. Polls the shared flag (the stdin watcher flips it) — matches
+    /// the Python harness's `_wait_if_paused`.
+    fn wait_if_paused(&self) {
+        if !self.control.pause.load(Ordering::Relaxed) {
+            return;
+        }
+        self.emitter.console("paused");
+        while self.control.pause.load(Ordering::Relaxed) && !self.cancelled() {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        self.emitter.console("resumed");
     }
 
     pub fn checkpoints_dir(&self) -> std::path::PathBuf {
@@ -108,6 +189,7 @@ impl<'a> Run<'a> {
     }
 
     pub fn epoch(&mut self, i: u32) {
+        self.wait_if_paused(); // honor a pause request at the epoch boundary
         self.epoch = i;
         let event = json!({
             "ev": "epoch",
@@ -208,5 +290,38 @@ impl<'a> Run<'a> {
                 max: value,
                 count: 1,
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancel_command_sets_flag_and_releases_pause() {
+        let c = Control::default();
+        c.pause.store(true, Ordering::Relaxed);
+        c.handle("{\"cmd\":\"cancel\"}");
+        assert!(c.cancel.load(Ordering::Relaxed));
+        assert!(!c.pause.load(Ordering::Relaxed)); // cancel releases a paused loop
+    }
+
+    #[test]
+    fn pause_and_resume_toggle_the_flag() {
+        let c = Control::default();
+        c.handle("{\"cmd\":\"pause\"}");
+        assert!(c.pause.load(Ordering::Relaxed));
+        c.handle("{\"cmd\":\"resume\"}");
+        assert!(!c.pause.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn malformed_or_unknown_commands_are_ignored() {
+        let c = Control::default();
+        c.handle("not json");
+        c.handle("{\"cmd\":\"explode\"}");
+        c.handle("{}");
+        assert!(!c.cancel.load(Ordering::Relaxed));
+        assert!(!c.pause.load(Ordering::Relaxed));
     }
 }

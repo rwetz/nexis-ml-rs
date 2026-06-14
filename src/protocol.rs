@@ -31,6 +31,12 @@ impl Emitter {
         Self::new(flag || std::env::var(ENV_FLAG).as_deref() == Ok("1"))
     }
 
+    /// Whether protocol mode is on. The stdin control-command watcher only
+    /// runs in protocol mode (a plain terminal uses Ctrl+C, not NDJSON).
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// Emit one event to stdout (if enabled) and return it so the caller
     /// can also append it to the run's metrics.jsonl.
     pub fn emit(&self, event: serde_json::Value) -> serde_json::Value {

@@ -367,6 +367,11 @@ pub fn train(project: &Path, emitter: &Emitter) -> std::io::Result<i32> {
             start = end;
         }
 
+        // Stop promptly on a cancel command — the last best.json is kept.
+        if run.cancelled() {
+            break;
+        }
+
         // Validation.
         let logits = model.forward(x_val.clone());
         let vloss = loss_fn
@@ -409,11 +414,15 @@ pub fn train(project: &Path, emitter: &Emitter) -> std::io::Result<i32> {
             );
         }
 
-        run.epoch(epoch);
+        run.epoch(epoch); // honors a pause request at the boundary
+        if run.cancelled() {
+            break;
+        }
     }
 
     run.info(&format!("best val loss: {best_val:.4}"));
-    run.finish("ok");
+    let status = if run.cancelled() { "cancelled" } else { "ok" };
+    run.finish(status);
     Ok(0)
 }
 

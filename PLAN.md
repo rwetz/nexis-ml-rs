@@ -24,6 +24,14 @@ class column, train-split standardization) or falls back to synthetic
 data. Verified: trains to ~0 loss on the Python tabular `example.csv`, and
 the Python `nexis-ml runs` reads the burn-produced run unchanged. v0.2.0.
 
+### Run control (cancel/pause/resume) ✅ (2026-06-14, v0.2.1)
+The engine now honors the same stdin **control commands** as the Python
+harness: a daemon-style watcher reads `{"cmd":"cancel"|"pause"|"resume"}`
+in protocol mode and flips shared flags. `cancel` makes the training loop
+break and finish as `cancelled` (keeping the last checkpoint); `pause` /
+`resume` block/release at the next epoch boundary. Closes the gap where
+Nexis's Stop/Pause buttons were no-ops against the Rust engine.
+
 ### M3 — GPU via `wgpu`
 Add burn's `wgpu` backend so it runs on any modern GPU without a vendor
 toolchain (the headline "GPU on any box" win over CUDA-only PyTorch).
