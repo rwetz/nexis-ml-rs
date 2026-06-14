@@ -232,6 +232,16 @@ impl<B: Backend> Mlp<B> {
 
 // ── training ──────────────────────────────────────────────────────────
 
+fn apply_standardization(rows: &mut [Vec<f32>], mean: &[f32], std: &[f32]) {
+    for row in rows.iter_mut() {
+        for (d, v) in row.iter_mut().enumerate() {
+            *v = (*v - mean[d]) / std[d];
+        }
+    }
+}
+
+/// Compute train-split mean/std, standardize `x` in place, and return the
+/// stats so the val split can be transformed with the same numbers.
 fn standardize(x: &mut [Vec<f32>], n_features: usize) -> (Vec<f32>, Vec<f32>) {
     let n = x.len().max(1) as f32;
     let mut mean = vec![0.0f32; n_features];
@@ -252,11 +262,7 @@ fn standardize(x: &mut [Vec<f32>], n_features: usize) -> (Vec<f32>, Vec<f32>) {
     for s in &mut std {
         *s = (*s / n).sqrt().max(1e-8);
     }
-    for row in x.iter_mut() {
-        for d in 0..n_features {
-            row[d] = (row[d] - mean[d]) / std[d];
-        }
-    }
+    apply_standardization(x, &mean, &std);
     (mean, std)
 }
 
@@ -298,17 +304,12 @@ pub fn train(project: &Path, emitter: &Emitter) -> std::io::Result<i32> {
     let n_val = ((data.x.len() as f64 * cfg.val_split) as usize).max(1);
     let mut train_x = data.x.split_off(n_val);
     let train_y = data.y.split_off(n_val);
-    let val_x = data.x; // first n_val
+    let mut val_x = data.x; // first n_val
     let val_y = data.y;
 
-    // Standardize on train stats, apply to both splits.
+    // Standardize on train stats, apply the same transform to the val split.
     let (mean, std) = standardize(&mut train_x, n_features);
-    let mut val_x = val_x;
-    for row in val_x.iter_mut() {
-        for d in 0..n_features {
-            row[d] = (row[d] - mean[d]) / std[d];
-        }
-    }
+    apply_standardization(&mut val_x, &mean, &std);
 
     if cfg.device != "cpu" {
         emitter.console(&format!(

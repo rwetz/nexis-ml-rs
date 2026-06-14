@@ -118,13 +118,12 @@ fn cmd_new(pos: &[String]) -> i32 {
         eprintln!("error: {e}");
         return 1;
     }
-    let out = if std::env::var(ENV_FLAG).as_deref() == Ok("1") {
+    // Protocol mode keeps stdout clean (humans read stderr).
+    if std::env::var(ENV_FLAG).as_deref() == Ok("1") {
         eprintln!("created project at {dir}");
         return 0;
-    } else {
-        format!("created project at {dir}\nnext:\n  cd {dir}\n  nexis-ml train")
-    };
-    println!("{out}");
+    }
+    println!("created project at {dir}\nnext:\n  cd {dir}\n  nexis-ml train");
     0
 }
 
