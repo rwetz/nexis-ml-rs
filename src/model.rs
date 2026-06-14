@@ -67,15 +67,36 @@ struct DataCfg {
     target: Option<String>,
 }
 
-#[derive(Deserialize)]
+/// `[model] hidden` accepts either a single width (`hidden = 16`) or an
+/// explicit list of hidden-layer widths (`hidden = [64, 32]`) — the
+/// declarative MLP-depth knob. Both normalize to a `Vec` via `layers()`.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(untagged)]
+enum HiddenSpec {
+    Scalar(usize),
+    Layers(Vec<usize>),
+}
+
+impl Default for HiddenSpec {
+    fn default() -> Self {
+        HiddenSpec::Scalar(16)
+    }
+}
+
+impl HiddenSpec {
+    /// Hidden-layer widths; an empty list means a bare linear classifier.
+    fn layers(&self) -> Vec<usize> {
+        match self {
+            HiddenSpec::Scalar(n) => vec![*n],
+            HiddenSpec::Layers(v) => v.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
 #[serde(default)]
 struct ModelCfg {
-    hidden: usize,
-}
-impl Default for ModelCfg {
-    fn default() -> Self {
-        Self { hidden: 16 }
-    }
+    hidden: HiddenSpec,
 }
 
 #[derive(Deserialize, Default)]
@@ -215,19 +236,35 @@ fn err(msg: String) -> std::io::Error {
 
 #[derive(Module, Debug)]
 struct Mlp<B: Backend> {
-    fc1: Linear<B>,
-    fc2: Linear<B>,
+    layers: Vec<Linear<B>>,
 }
 
 impl<B: Backend> Mlp<B> {
-    fn new(in_dim: usize, hidden: usize, out_dim: usize, device: &B::Device) -> Self {
-        Self {
-            fc1: LinearConfig::new(in_dim, hidden).init(device),
-            fc2: LinearConfig::new(hidden, out_dim).init(device),
-        }
+    /// Build an MLP with the given `hidden` widths bracketed by the input and
+    /// output dims; an empty `hidden` yields a single linear layer. ReLU
+    /// between layers, none after the last (logits).
+    fn new(in_dim: usize, hidden: &[usize], out_dim: usize, device: &B::Device) -> Self {
+        let mut dims = Vec::with_capacity(hidden.len() + 2);
+        dims.push(in_dim);
+        dims.extend_from_slice(hidden);
+        dims.push(out_dim);
+        let layers = dims
+            .windows(2)
+            .map(|w| LinearConfig::new(w[0], w[1]).init(device))
+            .collect();
+        Self { layers }
     }
+
     fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        self.fc2.forward(relu(self.fc1.forward(x)))
+        let last = self.layers.len() - 1;
+        let mut x = x;
+        for (i, layer) in self.layers.iter().enumerate() {
+            x = layer.forward(x);
+            if i != last {
+                x = relu(x);
+            }
+        }
+        x
     }
 }
 
@@ -437,7 +474,8 @@ fn run_training<B: AutodiffBackend>(
     let y_train = to_targets::<B>(&data.train_y, &device);
     let x_val = to_tensor::<B>(&data.val_x, n_features, &device);
 
-    let mut model = Mlp::<B>::new(n_features, root.model.hidden, n_classes, &device);
+    let hidden = root.model.hidden.layers();
+    let mut model = Mlp::<B>::new(n_features, &hidden, n_classes, &device);
     let mut opt = AdamConfig::new().init();
     let loss_fn = CrossEntropyLossConfig::new().init(&device);
 
@@ -447,7 +485,7 @@ fn run_training<B: AutodiffBackend>(
             "epochs": cfg.epochs, "batch_size": cfg.batch_size, "lr": cfg.lr,
             "val_split": cfg.val_split, "seed": cfg.seed, "device": cfg.device,
         },
-        "model": {"hidden": root.model.hidden},
+        "model": {"hidden": hidden},
         "engine": "nexis-ml-rs",
         "derived": {"classes": data.classes, "task": "classification",
                     "features": data.feature_names},
@@ -461,10 +499,9 @@ fn run_training<B: AutodiffBackend>(
         device_label,
     );
     run.info(&format!(
-        "burn MLP (Rust engine, {device_label}): {} train / {} val rows, {n_features} features, {n_classes} classes, hidden={}",
+        "burn MLP (Rust engine, {device_label}): {} train / {} val rows, {n_features} features, {n_classes} classes, hidden={hidden:?}",
         data.train_x.len(),
         data.val_x.len(),
-        root.model.hidden
     ));
 
     let n_train = data.train_x.len();
@@ -534,7 +571,7 @@ fn run_training<B: AutodiffBackend>(
             // the inference milestone); enough to satisfy the contract.
             let ckpt = json!({
                 "classes": data.classes, "features": data.feature_names,
-                "hidden": root.model.hidden, "mean": data.mean, "std": data.std,
+                "hidden": hidden, "mean": data.mean, "std": data.std,
             });
             let _ = fs::write(
                 run.checkpoints_dir().join("best.json"),
@@ -557,6 +594,20 @@ fn run_training<B: AutodiffBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_spec_accepts_scalar_and_list() {
+        #[derive(Deserialize)]
+        struct M {
+            hidden: HiddenSpec,
+        }
+        let scalar: M = toml::from_str("hidden = 32").unwrap();
+        assert_eq!(scalar.hidden.layers(), vec![32]);
+        let list: M = toml::from_str("hidden = [64, 16]").unwrap();
+        assert_eq!(list.hidden.layers(), vec![64, 16]);
+        // default is a single hidden layer
+        assert_eq!(HiddenSpec::default().layers(), vec![16]);
+    }
 
     #[test]
     fn load_csv_parses_features_and_classes() {
