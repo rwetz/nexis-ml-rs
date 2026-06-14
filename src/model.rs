@@ -336,43 +336,24 @@ fn wgpu_mem_mb(device: &WgpuDevice) -> Option<f64> {
 
 // ── training ──────────────────────────────────────────────────────────
 
-/// Pick the backend from the configured device and run training on it. The
-/// backend is a compile-time type, so we monomorphize `run_training` for
-/// each path rather than dispatching dynamically.
-pub fn train(project: &Path, emitter: &Emitter) -> std::io::Result<i32> {
-    let root = load_root(project);
-    if want_gpu(&root.train.device, emitter) {
-        let device = WgpuDevice::default();
-        let mem_dev = device.clone();
-        run_training::<Autodiff<Wgpu>>(project, emitter, &root, device, "gpu", move || {
-            wgpu_mem_mb(&mem_dev)
-        })
-    } else {
-        run_training::<Autodiff<NdArray>>(
-            project,
-            emitter,
-            &root,
-            NdArrayDevice::default(),
-            "cpu",
-            || None,
-        )
-    }
+/// Backend-independent training data: shuffled and split into train/val with
+/// the train-split standardization applied, plus the class/feature names for
+/// the run config and artifacts. Prepared once, before the backend is chosen,
+/// so this (identical) data work isn't monomorphized per backend.
+struct Prepared {
+    train_x: Vec<Vec<f32>>,
+    train_y: Vec<usize>,
+    val_x: Vec<Vec<f32>>,
+    val_y: Vec<usize>,
+    mean: Vec<f32>,
+    std: Vec<f32>,
+    feature_names: Vec<String>,
+    classes: Vec<String>,
 }
 
-// `slice([a..b])` is burn's ranges-array API, not an accidental 1-element
-// range vec — clippy's lint is a false positive here.
-#[allow(clippy::single_range_in_vec_init)]
-fn run_training<B: AutodiffBackend>(
-    project: &Path,
-    emitter: &Emitter,
-    root: &Root,
-    device: B::Device,
-    device_label: &str,
-    mem_probe: impl Fn() -> Option<f64>,
-) -> std::io::Result<i32> {
+/// Load (CSV or synthetic), shuffle, split, and standardize on train stats.
+fn prepare(project: &Path, root: &Root) -> std::io::Result<Prepared> {
     let cfg = &root.train;
-
-    // Load CSV if configured, else synthetic.
     let mut data = match &root.data.path {
         Some(p) if project.join(p).is_file() => {
             let target = root.data.target.as_deref().unwrap_or("label");
@@ -381,9 +362,8 @@ fn run_training<B: AutodiffBackend>(
         _ => synthetic(cfg),
     };
     let n_features = data.feature_names.len();
-    let n_classes = data.classes.len();
 
-    // Shuffle + split.
+    // Shuffle, then split the validation rows off the front.
     let mut rng = Rng(cfg.seed ^ 0xABCD);
     for i in (1..data.x.len()).rev() {
         let j = rng.below(i + 1);
@@ -400,9 +380,62 @@ fn run_training<B: AutodiffBackend>(
     let (mean, std) = standardize(&mut train_x, n_features);
     apply_standardization(&mut val_x, &mean, &std);
 
-    let x_train = to_tensor::<B>(&train_x, n_features, &device);
-    let y_train = to_targets::<B>(&train_y, &device);
-    let x_val = to_tensor::<B>(&val_x, n_features, &device);
+    Ok(Prepared {
+        train_x,
+        train_y,
+        val_x,
+        val_y,
+        mean,
+        std,
+        feature_names: data.feature_names,
+        classes: data.classes,
+    })
+}
+
+/// Pick the backend from the configured device and run training on it. The
+/// backend is a compile-time type, so we monomorphize `run_training` for each
+/// path rather than dispatching dynamically; the data prep is shared.
+pub fn train(project: &Path, emitter: &Emitter) -> std::io::Result<i32> {
+    let root = load_root(project);
+    let data = prepare(project, &root)?;
+    if want_gpu(&root.train.device, emitter) {
+        let device = WgpuDevice::default();
+        let mem_dev = device.clone();
+        run_training::<Autodiff<Wgpu>>(project, emitter, &root, data, device, "gpu", move || {
+            wgpu_mem_mb(&mem_dev)
+        })
+    } else {
+        run_training::<Autodiff<NdArray>>(
+            project,
+            emitter,
+            &root,
+            data,
+            NdArrayDevice::default(),
+            "cpu",
+            || None,
+        )
+    }
+}
+
+// `slice([a..b])` is burn's ranges-array API, not an accidental 1-element
+// range vec — clippy's lint is a false positive here.
+#[allow(clippy::single_range_in_vec_init)]
+fn run_training<B: AutodiffBackend>(
+    project: &Path,
+    emitter: &Emitter,
+    root: &Root,
+    data: Prepared,
+    device: B::Device,
+    device_label: &str,
+    mem_probe: impl Fn() -> Option<f64>,
+) -> std::io::Result<i32> {
+    let cfg = &root.train;
+    let n_features = data.feature_names.len();
+    let n_classes = data.classes.len();
+
+    let x_train = to_tensor::<B>(&data.train_x, n_features, &device);
+    let y_train = to_targets::<B>(&data.train_y, &device);
+    let x_val = to_tensor::<B>(&data.val_x, n_features, &device);
 
     let mut model = Mlp::<B>::new(n_features, root.model.hidden, n_classes, &device);
     let mut opt = AdamConfig::new().init();
@@ -429,12 +462,12 @@ fn run_training<B: AutodiffBackend>(
     );
     run.info(&format!(
         "burn MLP (Rust engine, {device_label}): {} train / {} val rows, {n_features} features, {n_classes} classes, hidden={}",
-        train_x.len(),
-        val_x.len(),
+        data.train_x.len(),
+        data.val_x.len(),
         root.model.hidden
     ));
 
-    let n_train = train_x.len();
+    let n_train = data.train_x.len();
     let bs = cfg.batch_size.max(1);
     let mut best_val = f64::INFINITY;
 
@@ -463,7 +496,7 @@ fn run_training<B: AutodiffBackend>(
         // Validation.
         let logits = model.forward(x_val.clone());
         let vloss = loss_fn
-            .forward(logits.clone(), to_targets::<B>(&val_y, &device))
+            .forward(logits.clone(), to_targets::<B>(&data.val_y, &device))
             .into_scalar()
             .elem::<f64>();
         // iter() converts the backend's int dtype (i64 on ndarray, i32 on
@@ -471,7 +504,7 @@ fn run_training<B: AutodiffBackend>(
         let preds: Vec<i64> = logits.argmax(1).into_data().iter::<i64>().collect();
         let mut correct = 0usize;
         let mut cm = vec![vec![0u32; n_classes]; n_classes];
-        for (p, &t) in preds.iter().zip(val_y.iter()) {
+        for (p, &t) in preds.iter().zip(data.val_y.iter()) {
             let pred = *p as usize;
             if pred == t {
                 correct += 1;
@@ -480,7 +513,7 @@ fn run_training<B: AutodiffBackend>(
                 cm[t][pred] += 1;
             }
         }
-        let acc = correct as f64 / val_y.len().max(1) as f64;
+        let acc = correct as f64 / data.val_y.len().max(1) as f64;
         run.log(&[("loss/val", vloss), ("acc/val", acc)], epoch);
         // GPU memory footprint, when the backend reports it (CPU → None).
         if let Some(mb) = mem_probe() {
@@ -501,7 +534,7 @@ fn run_training<B: AutodiffBackend>(
             // the inference milestone); enough to satisfy the contract.
             let ckpt = json!({
                 "classes": data.classes, "features": data.feature_names,
-                "hidden": root.model.hidden, "mean": mean, "std": std,
+                "hidden": root.model.hidden, "mean": data.mean, "std": data.std,
             });
             let _ = fs::write(
                 run.checkpoints_dir().join("best.json"),
