@@ -5,32 +5,33 @@
 // ╚══════════════════════════════════════╝
 
 //! The `train` command's model — a real MLP classifier built on
-//! [`burn`](https://github.com/tracel-ai/burn) (ndarray/CPU backend with
-//! autodiff). Loads a CSV when `[data] path` points at one (the "my
-//! spreadsheet, what predicts what" case), otherwise trains on a built-in
-//! synthetic two-blob dataset so `train` works out of the box. Drives the
-//! same `Run` lifecycle as the Python engine, so Nexis renders it
-//! identically. GPU (wgpu) is the next milestone — see PLAN.md.
+//! [`burn`](https://github.com/tracel-ai/burn), generic over the backend:
+//! `[train] device` picks CPU (ndarray) or GPU (wgpu), both with autodiff.
+//! Loads a CSV when `[data] path` points at one (the "my spreadsheet, what
+//! predicts what" case), otherwise trains on a built-in synthetic two-blob
+//! dataset so `train` works out of the box. Drives the same `Run` lifecycle
+//! as the Python engine, so Nexis renders it identically.
 
 use std::fs;
 use std::path::Path;
 
 use burn::backend::ndarray::NdArrayDevice;
+use burn::backend::wgpu::{Wgpu, WgpuDevice};
 use burn::backend::{Autodiff, NdArray};
 use burn::module::Module;
 use burn::nn::loss::CrossEntropyLossConfig;
 use burn::nn::{Linear, LinearConfig};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::tensor::activation::relu;
-use burn::tensor::{backend::Backend, Int, Tensor, TensorData};
+use burn::tensor::{
+    backend::AutodiffBackend, backend::Backend, ElementConversion, Int, Tensor, TensorData,
+};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::harness::Run;
 use crate::protocol::Emitter;
 use crate::run_store;
-
-type AB = Autodiff<NdArray>;
 
 // ── config (train.toml) ───────────────────────────────────────────────
 
@@ -266,21 +267,109 @@ fn standardize(x: &mut [Vec<f32>], n_features: usize) -> (Vec<f32>, Vec<f32>) {
     (mean, std)
 }
 
-fn to_tensor(rows: &[Vec<f32>], n_features: usize, device: &NdArrayDevice) -> Tensor<AB, 2> {
+fn to_tensor<B: Backend>(rows: &[Vec<f32>], n_features: usize, device: &B::Device) -> Tensor<B, 2> {
     let flat: Vec<f32> = rows.iter().flatten().copied().collect();
-    Tensor::<AB, 2>::from_data(TensorData::new(flat, [rows.len(), n_features]), device)
+    // from_data resolves the backend's float dtype from the device and
+    // converts, so the same f32 source works for ndarray and wgpu.
+    Tensor::<B, 2>::from_data(TensorData::new(flat, [rows.len(), n_features]), device)
 }
 
-fn to_targets(labels: &[usize], device: &NdArrayDevice) -> Tensor<AB, 1, Int> {
+fn to_targets<B: Backend>(labels: &[usize], device: &B::Device) -> Tensor<B, 1, Int> {
     let ints: Vec<i64> = labels.iter().map(|&v| v as i64).collect();
-    Tensor::<AB, 1, Int>::from_data(TensorData::new(ints, [labels.len()]), device)
+    Tensor::<B, 1, Int>::from_data(TensorData::new(ints, [labels.len()]), device)
+}
+
+// ── device selection ──────────────────────────────────────────────────
+
+/// Probe for a usable wgpu adapter without aborting the process. The wgpu
+/// runtime initializes lazily and panics when no adapter is found, so we
+/// force a one-element allocation inside `catch_unwind` (panic hook
+/// silenced) and report success. `auto` falls back to CPU silently; `gpu`
+/// warns first.
+pub(crate) fn gpu_available() -> bool {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {})); // keep the probe's panic off stderr
+    let ok = std::panic::catch_unwind(|| {
+        let device = WgpuDevice::default();
+        let _ = Tensor::<Wgpu, 1>::zeros([1], &device).into_data();
+    })
+    .is_ok();
+    std::panic::set_hook(prev);
+    ok
+}
+
+/// Resolve the `[train] device` preference to a backend choice. `cpu` (and
+/// unknown values) use CPU; `gpu`/`cuda`/`wgpu` use the GPU when present
+/// (warning on fallback); `auto` (or empty) silently prefers the GPU. Keeps
+/// the same vocabulary as the Python engine's `device`.
+fn want_gpu(pref: &str, emitter: &Emitter) -> bool {
+    match pref.trim().to_ascii_lowercase().as_str() {
+        "cpu" => false,
+        "gpu" | "cuda" | "wgpu" => {
+            if gpu_available() {
+                true
+            } else {
+                emitter.console(
+                    "note: device \"gpu\" requested but no compatible GPU adapter found — using CPU",
+                );
+                false
+            }
+        }
+        "auto" | "" => gpu_available(),
+        other => {
+            emitter.console(&format!("note: unknown device \"{other}\" — using CPU"));
+            false
+        }
+    }
+}
+
+/// Current wgpu memory footprint in MiB (best-effort; `None` if unavailable).
+/// Queries the same cubecl compute client the backend uses, keyed by device,
+/// so it reflects this run's allocations — the wgpu analogue of the Python
+/// engine's `torch.cuda.memory_allocated`.
+fn wgpu_mem_mb(device: &WgpuDevice) -> Option<f64> {
+    use burn::cubecl::Runtime;
+    let client = burn::backend::wgpu::WgpuRuntime::client(device);
+    let usage = client.memory_usage().ok()?;
+    Some(usage.bytes_in_use as f64 / (1024.0 * 1024.0))
+}
+
+// ── training ──────────────────────────────────────────────────────────
+
+/// Pick the backend from the configured device and run training on it. The
+/// backend is a compile-time type, so we monomorphize `run_training` for
+/// each path rather than dispatching dynamically.
+pub fn train(project: &Path, emitter: &Emitter) -> std::io::Result<i32> {
+    let root = load_root(project);
+    if want_gpu(&root.train.device, emitter) {
+        let device = WgpuDevice::default();
+        let mem_dev = device.clone();
+        run_training::<Autodiff<Wgpu>>(project, emitter, &root, device, "gpu", move || {
+            wgpu_mem_mb(&mem_dev)
+        })
+    } else {
+        run_training::<Autodiff<NdArray>>(
+            project,
+            emitter,
+            &root,
+            NdArrayDevice::default(),
+            "cpu",
+            || None,
+        )
+    }
 }
 
 // `slice([a..b])` is burn's ranges-array API, not an accidental 1-element
 // range vec — clippy's lint is a false positive here.
 #[allow(clippy::single_range_in_vec_init)]
-pub fn train(project: &Path, emitter: &Emitter) -> std::io::Result<i32> {
-    let root = load_root(project);
+fn run_training<B: AutodiffBackend>(
+    project: &Path,
+    emitter: &Emitter,
+    root: &Root,
+    device: B::Device,
+    device_label: &str,
+    mem_probe: impl Fn() -> Option<f64>,
+) -> std::io::Result<i32> {
     let cfg = &root.train;
 
     // Load CSV if configured, else synthetic.
@@ -311,19 +400,11 @@ pub fn train(project: &Path, emitter: &Emitter) -> std::io::Result<i32> {
     let (mean, std) = standardize(&mut train_x, n_features);
     apply_standardization(&mut val_x, &mean, &std);
 
-    if cfg.device != "cpu" {
-        emitter.console(&format!(
-            "note: device \"{}\" not supported by the Rust engine yet — using CPU (GPU lands with the wgpu backend)",
-            cfg.device
-        ));
-    }
+    let x_train = to_tensor::<B>(&train_x, n_features, &device);
+    let y_train = to_targets::<B>(&train_y, &device);
+    let x_val = to_tensor::<B>(&val_x, n_features, &device);
 
-    let device = NdArrayDevice::default();
-    let x_train = to_tensor(&train_x, n_features, &device);
-    let y_train = to_targets(&train_y, &device);
-    let x_val = to_tensor(&val_x, n_features, &device);
-
-    let mut model = Mlp::<AB>::new(n_features, root.model.hidden, n_classes, &device);
+    let mut model = Mlp::<B>::new(n_features, root.model.hidden, n_classes, &device);
     let mut opt = AdamConfig::new().init();
     let loss_fn = CrossEntropyLossConfig::new().init(&device);
 
@@ -338,9 +419,16 @@ pub fn train(project: &Path, emitter: &Emitter) -> std::io::Result<i32> {
         "derived": {"classes": data.classes, "task": "classification",
                     "features": data.feature_names},
     });
-    let mut run = Run::start(emitter, dir, "tabular", config_json, cfg.epochs, "cpu");
+    let mut run = Run::start(
+        emitter,
+        dir,
+        "tabular",
+        config_json,
+        cfg.epochs,
+        device_label,
+    );
     run.info(&format!(
-        "burn MLP (Rust engine): {} train / {} val rows, {n_features} features, {n_classes} classes, hidden={}",
+        "burn MLP (Rust engine, {device_label}): {} train / {} val rows, {n_features} features, {n_classes} classes, hidden={}",
         train_x.len(),
         val_x.len(),
         root.model.hidden
@@ -359,7 +447,7 @@ pub fn train(project: &Path, emitter: &Emitter) -> std::io::Result<i32> {
             let yb = y_train.clone().slice([start..end]);
             let logits = model.forward(xb);
             let loss = loss_fn.forward(logits, yb);
-            let loss_val = loss.clone().into_scalar() as f64;
+            let loss_val = loss.clone().into_scalar().elem::<f64>();
             let grads = loss.backward();
             let gp = GradientsParams::from_grads(grads, &model);
             model = opt.step(cfg.lr, model, gp);
@@ -375,9 +463,12 @@ pub fn train(project: &Path, emitter: &Emitter) -> std::io::Result<i32> {
         // Validation.
         let logits = model.forward(x_val.clone());
         let vloss = loss_fn
-            .forward(logits.clone(), to_targets(&val_y, &device))
-            .into_scalar() as f64;
-        let preds: Vec<i64> = logits.argmax(1).into_data().to_vec().unwrap_or_default();
+            .forward(logits.clone(), to_targets::<B>(&val_y, &device))
+            .into_scalar()
+            .elem::<f64>();
+        // iter() converts the backend's int dtype (i64 on ndarray, i32 on
+        // wgpu); to_vec() would reject the mismatch and silently drop preds.
+        let preds: Vec<i64> = logits.argmax(1).into_data().iter::<i64>().collect();
         let mut correct = 0usize;
         let mut cm = vec![vec![0u32; n_classes]; n_classes];
         for (p, &t) in preds.iter().zip(val_y.iter()) {
@@ -391,6 +482,10 @@ pub fn train(project: &Path, emitter: &Emitter) -> std::io::Result<i32> {
         }
         let acc = correct as f64 / val_y.len().max(1) as f64;
         run.log(&[("loss/val", vloss), ("acc/val", acc)], epoch);
+        // GPU memory footprint, when the backend reports it (CPU → None).
+        if let Some(mb) = mem_probe() {
+            run.log(&[("mem/gpu_mb", mb)], epoch);
+        }
 
         let cm_path = run.artifacts_dir().join(format!("cm-epoch{epoch}.json"));
         let cm_json = json!({"labels": data.classes, "matrix": cm});

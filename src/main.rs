@@ -76,6 +76,13 @@ fn positionals(args: &[String], cmd: &str) -> Vec<String> {
 /// python/torch/cudaAvailable/gpuName keys so Nexis's env probe doesn't
 /// need a special case, and adds engine/backend fields.
 fn cmd_env() -> i32 {
+    // wgpu GPU is reported via `backend` (cudaAvailable/gpuName stay
+    // CUDA-specific — they drive the Python engine's torch-install UI).
+    let backend = if model::gpu_available() {
+        "wgpu"
+    } else {
+        "cpu"
+    };
     let info = serde_json::json!({
         "engine": "nexis-ml-rs",
         "nexisMl": env!("CARGO_PKG_VERSION"),
@@ -83,7 +90,7 @@ fn cmd_env() -> i32 {
         "torch": serde_json::Value::Null,
         "cudaAvailable": false,
         "gpuName": serde_json::Value::Null,
-        "backend": "cpu",
+        "backend": backend,
     });
     println!("{}", serde_json::to_string(&info).unwrap_or_default());
     0
@@ -100,7 +107,7 @@ lr = 0.2
 val_split = 0.2
 seed = 42
 samples = 240        # synthetic two-blob points to generate
-device = \"cpu\"        # cpu only for now; GPU arrives with the burn backend
+device = \"auto\"       # auto | cpu | gpu  (auto uses the GPU via wgpu when present)
 ";
 
 fn cmd_new(pos: &[String]) -> i32 {

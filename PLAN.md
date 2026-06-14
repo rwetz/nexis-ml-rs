@@ -32,11 +32,22 @@ break and finish as `cancelled` (keeping the last checkpoint); `pause` /
 `resume` block/release at the next epoch boundary. Closes the gap where
 Nexis's Stop/Pause buttons were no-ops against the Rust engine.
 
-### M3 — GPU via `wgpu`
-Add burn's `wgpu` backend so it runs on any modern GPU without a vendor
-toolchain (the headline "GPU on any box" win over CUDA-only PyTorch).
-`device = auto|cpu|gpu` in `train.toml`, mirroring the Python engine; emit
-`device` on `run.started` and a `mem/gpu_mb` line where the backend exposes it.
+### M3 — GPU via `wgpu` ✅ (2026-06-14, v0.3.0)
+`model.rs` is now generic over the burn backend and monomorphizes
+`run_training` for CPU (`Autodiff<NdArray>`) or GPU
+(`Autodiff<Wgpu>`) chosen from `[train] device`: `cpu`, `gpu`/`cuda`/`wgpu`
+(warns + falls back if no adapter), or `auto`/empty (silently prefers GPU).
+GPU availability is probed by forcing a one-element wgpu allocation inside
+`catch_unwind` so a headless/driverless box degrades to CPU instead of
+aborting. The resolved `device` rides on `run.started` + `summary.json`, and
+a per-epoch `mem/gpu_mb` line reports the wgpu compute client's
+`bytes_in_use` (the analogue of the Python engine's
+`torch.cuda.memory_allocated`; CPU emits none). `nexis-ml env` reports
+`backend: "wgpu"` when a GPU is present. Verified on an RTX 4070 SUPER:
+`device=auto` trains on GPU to acc 1.0, the Python `nexis-ml runs` reads the
+GPU-produced run unchanged, and `device=cpu` still works. The wgpu backend
+needs no vendor toolchain — the headline "GPU on any box" win over
+CUDA-only PyTorch.
 
 ### M4 — declarative model presets
 `train.toml` describes the model (MLP/CNN presets: layer sizes, conv
