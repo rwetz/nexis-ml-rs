@@ -1,6 +1,6 @@
 [package]
 name = "nexis-ml-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Python-free, single-binary ML engine for the Nexis terminal (Phase 3) — same NDJSON protocol and run store as nexis-ml."
 license = "Apache-2.0"
@@ -15,6 +15,7 @@ name = "nexis-ml"
 path = "src/main.rs"
 
 [dependencies]
+burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray", "autodiff"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

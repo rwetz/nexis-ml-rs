@@ -8,12 +8,13 @@ the Python [`nexis-ml`](https://github.com/rwetz/nexis-ml) engine, so Nexis
 renders runs from either with zero changes. The goal: an LSP-style
 downloadable engine for machines without a Python/PyTorch toolchain.
 
-> **Status: foundation slice.** Protocol, run store, and CLI are complete
-> and verified end-to-end (a Rust-produced run is read by the Python
-> `nexis-ml runs`). The `train` command currently uses a small built-in
-> linear classifier on synthetic data to prove the pipeline. The real
-> model backend is [`burn`](https://github.com/tracel-ai/burn) — see
-> [PLAN.md](PLAN.md).
+> **Status: real `burn` MLP (CPU).** Protocol, run store, and CLI are
+> complete and verified end-to-end (a Rust-produced run is read by the
+> Python `nexis-ml runs`). `train` runs a true MLP classifier on
+> [`burn`](https://github.com/tracel-ai/burn)'s ndarray/CPU backend with
+> autodiff — load a CSV via `[data] path` (the "my spreadsheet" case) or
+> fall back to built-in synthetic data. Next: GPU via `wgpu`, then
+> declarative MLP/CNN presets — see [PLAN.md](PLAN.md).
 
 ## Build & run
 
@@ -51,7 +52,7 @@ Same `protocol` version (1), same `metric`/`epoch`/`artifact`/
 | `src/protocol.rs` | NDJSON emitter (protocol v1) |
 | `src/run_store.rs` | run directory + atomic file writes (UTC stamp, no deps) |
 | `src/harness.rs` | `Run` lifecycle — ties emitter to the run store |
-| `src/model.rs` | the `train` command's classifier (to be `burn`-backed) |
+| `src/model.rs` | the `train` command's `burn` MLP + CSV/synthetic data |
 | `src/main.rs` | CLI (`--version` / `env` / `new` / `train`) |
 
 ## License

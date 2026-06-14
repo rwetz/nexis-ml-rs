@@ -48,7 +48,9 @@ impl<'a> Run<'a> {
     ) -> Self {
         dir.write_config(&config);
         let started_at = now_iso();
-        let abs = dir.path.canonicalize().unwrap_or_else(|_| dir.path.clone());
+        // absolute() (not canonicalize) so we match the Python engine's
+        // clean abspaths — canonicalize adds Windows \\?\ verbatim prefixes.
+        let abs = std::path::absolute(&dir.path).unwrap_or_else(|_| dir.path.clone());
         let event = json!({
             "ev": "run.started",
             "run": dir.run_id(),
@@ -128,7 +130,7 @@ impl<'a> Run<'a> {
     }
 
     pub fn artifact(&mut self, kind: &str, path: &std::path::Path) {
-        let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
         let p = abs.to_string_lossy().to_string();
         self.artifacts.push((kind.to_string(), p.clone()));
         let event = json!({

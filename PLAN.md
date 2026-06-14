@@ -15,11 +15,14 @@ classifier** on synthetic two-blob data driving the full `Run` lifecycle
 Verified: a Rust-produced run is listed by the Python `nexis-ml runs`.
 `cargo test`/`clippy -D warnings`/`fmt` clean.
 
-### M2 — `burn` backend (real models, CPU)
-Swap the hand-rolled math in `model.rs` for [`burn`](https://github.com/tracel-ai/burn)
-with the **ndarray** backend (pure Rust, no GPU toolchain). Keep the same
-`Run` lifecycle so nothing else changes. Start with an MLP matching the
-`tabular` template's architecture; load a CSV like the Python template.
+### M2 — `burn` backend (real models, CPU) ✅ (2026-06-14)
+`model.rs` now trains a real **MLP** (configurable hidden width) on
+[`burn`](https://github.com/tracel-ai/burn)'s **ndarray/CPU** backend with
+autodiff (Adam + cross-entropy, minibatches), behind the same `Run`
+lifecycle. Loads a CSV via `[data] path`/`target` (numeric features + a
+class column, train-split standardization) or falls back to synthetic
+data. Verified: trains to ~0 loss on the Python tabular `example.csv`, and
+the Python `nexis-ml runs` reads the burn-produced run unchanged. v0.2.0.
 
 ### M3 — GPU via `wgpu`
 Add burn's `wgpu` backend so it runs on any modern GPU without a vendor
