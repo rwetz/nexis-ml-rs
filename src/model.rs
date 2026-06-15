@@ -411,10 +411,31 @@ struct Prepared {
     classes: Vec<String>,
 }
 
+/// (train_x, train_y, val_x, val_y) — the result of a shuffle + front split.
+type Split = (Vec<Vec<f32>>, Vec<usize>, Vec<Vec<f32>>, Vec<usize>);
+
+/// Seeded Fisher-Yates shuffle, then split the validation rows off the front.
+/// Shared by the tabular and image prep — both carry `x` rows plus integer
+/// labels. Always leaves at least one training row.
+fn shuffle_split(mut x: Vec<Vec<f32>>, mut y: Vec<usize>, seed: u64, val_split: f64) -> Split {
+    let mut rng = Rng(seed ^ 0xABCD);
+    for i in (1..x.len()).rev() {
+        let j = rng.below(i + 1);
+        x.swap(i, j);
+        y.swap(i, j);
+    }
+    let n_val = ((x.len() as f64 * val_split) as usize)
+        .max(1)
+        .min(x.len().saturating_sub(1).max(1));
+    let train_x = x.split_off(n_val);
+    let train_y = y.split_off(n_val);
+    (train_x, train_y, x, y) // x, y are now the first n_val (validation)
+}
+
 /// Load (CSV or synthetic), shuffle, split, and standardize on train stats.
 fn prepare(project: &Path, root: &Root) -> std::io::Result<Prepared> {
     let cfg = &root.train;
-    let mut data = match &root.data.path {
+    let data = match &root.data.path {
         Some(p) if project.join(p).is_file() => {
             let target = root.data.target.as_deref().unwrap_or("label");
             load_csv(&project.join(p), target)?
@@ -422,19 +443,8 @@ fn prepare(project: &Path, root: &Root) -> std::io::Result<Prepared> {
         _ => synthetic(cfg),
     };
     let n_features = data.feature_names.len();
-
-    // Shuffle, then split the validation rows off the front.
-    let mut rng = Rng(cfg.seed ^ 0xABCD);
-    for i in (1..data.x.len()).rev() {
-        let j = rng.below(i + 1);
-        data.x.swap(i, j);
-        data.y.swap(i, j);
-    }
-    let n_val = ((data.x.len() as f64 * cfg.val_split) as usize).max(1);
-    let mut train_x = data.x.split_off(n_val);
-    let train_y = data.y.split_off(n_val);
-    let mut val_x = data.x; // first n_val
-    let val_y = data.y;
+    let (mut train_x, train_y, mut val_x, val_y) =
+        shuffle_split(data.x, data.y, cfg.seed, cfg.val_split);
 
     // Standardize on train stats, apply the same transform to the val split.
     let (mean, std) = standardize(&mut train_x, n_features);
@@ -468,6 +478,16 @@ fn confusion(preds: &[i64], targets: &[usize], n_classes: usize) -> (Vec<Vec<u32
         }
     }
     (cm, correct)
+}
+
+/// Write the per-epoch confusion-matrix JSON and register it as an artifact —
+/// the same `{labels, matrix}` shape the panel + report expect. Shared by the
+/// MLP and CNN loops.
+fn write_cm_artifact(run: &mut Run, epoch: u32, classes: &[String], cm: &[Vec<u32>]) {
+    let path = run.artifacts_dir().join(format!("cm-epoch{epoch}.json"));
+    let json = json!({ "labels": classes, "matrix": cm });
+    let _ = fs::write(&path, serde_json::to_string(&json).unwrap_or_default());
+    run.artifact("confusion-matrix", &path);
 }
 
 /// `[data] path` resolved to an image directory (a folder of class
@@ -606,13 +626,7 @@ fn run_training<B: AutodiffBackend>(
             run.log(&[("mem/gpu_mb", mb)], epoch);
         }
 
-        let cm_path = run.artifacts_dir().join(format!("cm-epoch{epoch}.json"));
-        let cm_json = json!({"labels": data.classes, "matrix": cm});
-        let _ = fs::write(
-            &cm_path,
-            serde_json::to_string(&cm_json).unwrap_or_default(),
-        );
-        run.artifact("confusion-matrix", &cm_path);
+        write_cm_artifact(&mut run, epoch, &data.classes, &cm);
 
         if vloss < best_val {
             best_val = vloss;
@@ -733,26 +747,15 @@ fn load_images(dir: &Path) -> std::io::Result<LoadedImages> {
 }
 
 /// Load, shuffle, and split image data (no standardization — pixels are
-/// already 0..1). Validation rows come off the front, mirroring `prepare`.
+/// already 0..1).
 fn prepare_images(dir: &Path, cfg: &TrainCfg) -> std::io::Result<PreparedImages> {
-    let (mut imgs, mut labels, classes, height, width) = load_images(dir)?;
-
-    let mut rng = Rng(cfg.seed ^ 0xABCD);
-    for i in (1..imgs.len()).rev() {
-        let j = rng.below(i + 1);
-        imgs.swap(i, j);
-        labels.swap(i, j);
-    }
-    let n_val = ((imgs.len() as f64 * cfg.val_split) as usize)
-        .max(1)
-        .min(imgs.len() - 1);
-    let train_x = imgs.split_off(n_val);
-    let train_y = labels.split_off(n_val);
+    let (imgs, labels, classes, height, width) = load_images(dir)?;
+    let (train_x, train_y, val_x, val_y) = shuffle_split(imgs, labels, cfg.seed, cfg.val_split);
     Ok(PreparedImages {
         train_x,
         train_y,
-        val_x: imgs,
-        val_y: labels,
+        val_x,
+        val_y,
         classes,
         height,
         width,
@@ -967,13 +970,7 @@ fn run_cnn_training<B: AutodiffBackend>(
             run.log(&[("mem/gpu_mb", mb)], epoch);
         }
 
-        let cm_path = run.artifacts_dir().join(format!("cm-epoch{epoch}.json"));
-        let cm_json = json!({"labels": data.classes, "matrix": cm});
-        let _ = fs::write(
-            &cm_path,
-            serde_json::to_string(&cm_json).unwrap_or_default(),
-        );
-        run.artifact("confusion-matrix", &cm_path);
+        write_cm_artifact(&mut run, epoch, &data.classes, &cm);
 
         let grid_path = run
             .artifacts_dir()
