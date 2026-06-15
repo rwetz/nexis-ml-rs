@@ -23,11 +23,12 @@ downloadable engine for machines without a Python/PyTorch toolchain.
 ```sh
 cargo build --release           # produces target/release/nexis-ml(.exe)
 
-nexis-ml --version              # → "nexis-ml 0.4.0" (Nexis-detectable)
+nexis-ml --version              # → "nexis-ml 0.5.0" (Nexis-detectable)
 nexis-ml env                    # one-line JSON capability report (backend: cpu|wgpu)
 nexis-ml new my-run             # scaffold a train.toml (device = "auto")
 nexis-ml train my-run           # train; writes .nexis-ml/runs/<id>/
 nexis-ml --nexis-protocol train my-run   # stream NDJSON protocol on stdout
+nexis-ml export --onnx my-run   # train the MLP and write my-run/model.onnx
 ```
 
 ### CPU or GPU
@@ -58,6 +59,16 @@ path` points at:
 list is a bare linear classifier). The CNN decodes folder-per-class images to
 grayscale (PNG/JPEG/BMP, resized to the first image's size) and emits a
 per-epoch confusion matrix plus an `image-grid` PNG of sample predictions.
+
+### ONNX export
+
+`nexis-ml export --onnx [dir]` trains the tabular MLP from `train.toml` and
+writes `<dir>/model.onnx` — a portable model for `ort`/onnxruntime inference
+without Python. Standardization is baked into the graph, so it takes **raw
+features** (input name `input`) and returns class logits (`output`). burn has
+no native ONNX export, so the protobuf is hand-encoded (no extra dependency);
+the export is verified against onnxruntime for an exact prediction match.
+(CNN/image ONNX export is a follow-up.)
 
 The binary is named `nexis-ml` (not `nexis-ml-rs`) so Nexis detects and
 spawns it exactly like the Python engine — the two are never on `PATH`
@@ -90,7 +101,8 @@ Stop and Pause buttons work against either engine.
 | `src/run_store.rs` | run directory + atomic file writes (UTC stamp, no deps) |
 | `src/harness.rs` | `Run` lifecycle + stdin control watcher (cancel/pause/resume) |
 | `src/model.rs` | the `train` command's `burn` MLP + CNN (CPU/GPU), device selection, CSV/synthetic + image data |
-| `src/main.rs` | CLI (`--version` / `env` / `new` / `train`) |
+| `src/onnx.rs` | dependency-free ONNX writer for the tabular MLP (`export --onnx`) |
+| `src/main.rs` | CLI (`--version` / `env` / `new` / `train` / `export`) |
 
 ## License
 

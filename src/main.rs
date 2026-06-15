@@ -8,11 +8,12 @@
 //! speaking the same NDJSON protocol and writing the same run store as the
 //! Python `nexis-ml`, so Nexis consumes either with no changes.
 //!
-//! Commands: --version | env | new [dir] | train [dir]
+//! Commands: --version | env | new [dir] | train [dir] | export --onnx [dir]
 //! Exit codes: 0 ok, 1 error, 2 usage.
 
 mod harness;
 mod model;
+mod onnx;
 mod protocol;
 mod run_store;
 
@@ -44,12 +45,13 @@ fn run() -> i32 {
         Some("env") => cmd_env(),
         Some("new") => cmd_new(&positionals(&args, "new")),
         Some("train") => cmd_train(&positionals(&args, "train"), &emitter),
+        Some("export") => cmd_export(&args, &positionals(&args, "export"), &emitter),
         Some(other) => {
             eprintln!("error: unknown command: {other}");
             2
         }
         None => {
-            eprintln!("usage: nexis-ml [--version] <env|new|train> [dir]");
+            eprintln!("usage: nexis-ml [--version] <env|new|train|export> [dir]");
             2
         }
     }
@@ -138,6 +140,28 @@ fn cmd_train(pos: &[String], emitter: &Emitter) -> i32 {
     let dir = pos.first().map(String::as_str).unwrap_or(".");
     match model::train(Path::new(dir), emitter) {
         Ok(code) => code,
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
+        }
+    }
+}
+
+/// `export --onnx [dir]` — train the tabular MLP from train.toml and write it
+/// as `<dir>/model.onnx`. `--onnx` is required (the only supported format);
+/// requiring it keeps room for other formats later.
+fn cmd_export(args: &[String], pos: &[String], emitter: &Emitter) -> i32 {
+    if !args.iter().any(|a| a == "--onnx") {
+        eprintln!("error: export requires --onnx (the only supported format)");
+        return 2;
+    }
+    let dir = pos.first().map(String::as_str).unwrap_or(".");
+    let out = Path::new(dir).join("model.onnx");
+    match model::export_onnx(Path::new(dir), &out) {
+        Ok(()) => {
+            emitter.console(&format!("wrote {}", out.display()));
+            0
+        }
         Err(e) => {
             eprintln!("error: {e}");
             1

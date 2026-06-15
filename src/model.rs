@@ -34,6 +34,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::harness::Run;
+use crate::onnx;
 use crate::protocol::Emitter;
 use crate::run_store;
 
@@ -1001,6 +1002,98 @@ fn run_cnn_training<B: AutodiffBackend>(
     let status = if run.cancelled() { "cancelled" } else { "ok" };
     run.finish(status);
     Ok(0)
+}
+
+// ── ONNX export (tabular MLP) ─────────────────────────────────────────
+
+/// Train an MLP on CPU and return it. A lean fit (no run dir / protocol /
+/// validation) for `export`, deterministic from the seed so the exported
+/// model matches a CPU `train`.
+#[allow(clippy::single_range_in_vec_init)]
+fn fit_mlp(data: &Prepared, cfg: &TrainCfg, hidden: &[usize]) -> Mlp<Autodiff<NdArray>> {
+    type B = Autodiff<NdArray>;
+    let device = NdArrayDevice::default();
+    let n_features = data.feature_names.len();
+    let n_classes = data.classes.len();
+    let x = to_tensor::<B>(&data.train_x, n_features, &device);
+    let y = to_targets::<B>(&data.train_y, &device);
+
+    let mut model = Mlp::<B>::new(n_features, hidden, n_classes, &device);
+    let mut opt = AdamConfig::new().init();
+    let loss_fn = CrossEntropyLossConfig::new().init(&device);
+    let n = data.train_x.len();
+    let bs = cfg.batch_size.max(1);
+    for _ in 0..cfg.epochs {
+        let mut start = 0;
+        while start < n {
+            let end = (start + bs).min(n);
+            let logits = model.forward(x.clone().slice([start..end]));
+            let loss = loss_fn.forward(logits, y.clone().slice([start..end]));
+            let grads = loss.backward();
+            let gp = GradientsParams::from_grads(grads, &model);
+            model = opt.step(cfg.lr, model, gp);
+            start = end;
+        }
+    }
+    model
+}
+
+/// Read a trained `Linear`'s weights as raw f32 + its stored shape (layout
+/// may be `[in, out]` or `[out, in]`; `onnx::Dense` records both so Gemm
+/// `transB` can be set from it). Missing bias → zeros.
+fn dense_of<B: Backend>(layer: &Linear<B>, in_dim: usize, out_dim: usize) -> onnx::Dense {
+    let w = layer.weight.val();
+    let [w_rows, w_cols] = w.dims();
+    let weight: Vec<f32> = w.into_data().iter::<f32>().collect();
+    let bias: Vec<f32> = match layer.bias.as_ref() {
+        Some(b) => b.val().into_data().iter::<f32>().collect(),
+        None => vec![0.0; out_dim],
+    };
+    onnx::Dense {
+        weight,
+        w_rows,
+        w_cols,
+        bias,
+        in_dim,
+        out_dim,
+    }
+}
+
+/// Train the tabular MLP from `train.toml` and write it to `out` as ONNX
+/// (raw features in → class logits out, standardization baked in). Image/CNN
+/// export is a follow-up.
+pub fn export_onnx(project: &Path, out: &Path) -> std::io::Result<()> {
+    let root = load_root(project);
+    if image_dir(project, &root).is_some() {
+        return Err(err(
+            "ONNX export currently supports tabular MLP models only (CNN export is a follow-up)"
+                .into(),
+        ));
+    }
+    let data = prepare(project, &root)?;
+    let hidden = root.model.hidden.layers();
+    let model = fit_mlp(&data, &root.train, &hidden);
+
+    // Layer dims: [features, hidden.., classes]; layer i maps dims[i]→dims[i+1].
+    let mut dims = Vec::with_capacity(hidden.len() + 2);
+    dims.push(data.feature_names.len());
+    dims.extend_from_slice(&hidden);
+    dims.push(data.classes.len());
+    let layers: Vec<onnx::Dense> = model
+        .layers
+        .iter()
+        .enumerate()
+        .map(|(i, l)| dense_of(l, dims[i], dims[i + 1]))
+        .collect();
+
+    onnx::write_mlp(
+        out,
+        data.feature_names.len(),
+        &data.mean,
+        &data.std,
+        &layers,
+        data.classes.len(),
+    )
 }
 
 #[cfg(test)]

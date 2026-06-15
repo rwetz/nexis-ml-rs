@@ -69,9 +69,20 @@ Both run the same `Run` lifecycle (cancel/pause, device selection,
 records the layer list; a 4-class image folder trains to acc 1.0 on CPU and
 GPU with both artifacts, and the Python `nexis-ml runs` reads either run.
 
-### M5 — `export --onnx`
-Export a trained model to ONNX (door-opener for an `ort`-based inference
-path), matching the stretch item in ML_SUITE.md.
+### M5 — `export --onnx` ✅ (2026-06-15, v0.5.0, tabular MLP)
+`nexis-ml export --onnx [dir]` trains the tabular MLP from `train.toml` and
+writes `<dir>/model.onnx`. burn has no native ONNX export, so `src/onnx.rs`
+hand-encodes the protobuf (proto3 wire format) for a `Sub`/`Div` (baked-in
+standardization) → `Gemm`/`Relu` graph — the model takes **raw features** and
+returns class logits, a door-opener for `ort`/onnxruntime inference without
+Python. No new Rust dependency (only `std`). Weight orientation is read from
+the trained `Linear` (Gemm `transB` set from the stored shape), so any MLP
+depth exports.
+
+Verified against onnxruntime 1.26: `onnx.checker` passes and onnxruntime's
+argmax matches the burn model **exactly** (48/48 val rows) on a `[16, 8]`
+MLP. CNN/ONNX export is a follow-up (Conv/MaxPool graph) — `export --onnx`
+on an image project errors clearly.
 
 ### M6 — Nexis integration (download + detect)
 Teach Nexis to download this binary to a managed dir and detect it
