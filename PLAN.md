@@ -49,11 +49,25 @@ GPU-produced run unchanged, and `device=cpu` still works. The wgpu backend
 needs no vendor toolchain — the headline "GPU on any box" win over
 CUDA-only PyTorch.
 
-### M4 — declarative model presets
-`train.toml` describes the model (MLP/CNN presets: layer sizes, conv
-channels) rather than code — the Rust engine can't run a user's `train.py`,
-so configuration is the editable surface here. Cover the `tabular` and
-`image` template shapes.
+### M4 — declarative model presets ✅ (2026-06-14, v0.4.0)
+The model is described in `train.toml`, not code (the Rust engine can't run a
+user's `train.py`, so config is the editable surface). The model kind is
+chosen from `[data] path`: a folder of class sub-folders → **CNN** over its
+images; a CSV (or no path → synthetic) → **MLP** over tabular rows.
+- **Tabular MLP**: `[model] hidden` is a single width (`16`) or an explicit
+  list of widths (`[64, 32]`) → an arbitrary-depth `Vec<Linear>` (empty list
+  = bare linear classifier).
+- **Image CNN**: folder-per-class images decoded to grayscale via the
+  [`image`](https://crates.io/crates/image) crate (resized to the first
+  image's size), trained by a `conv1`/`conv2`/`hidden` CNN (3×3 Same convs +
+  2×2 pools, flat size found by a dry run). Emits the per-epoch
+  confusion-matrix and an `image-grid` PNG (green/red correctness borders),
+  matching the Python `image` template.
+
+Both run the same `Run` lifecycle (cancel/pause, device selection,
+`mem/gpu_mb`). Verified on the RTX 4070 SUPER: `hidden=[32,16]` trains and
+records the layer list; a 4-class image folder trains to acc 1.0 on CPU and
+GPU with both artifacts, and the Python `nexis-ml runs` reads either run.
 
 ### M5 — `export --onnx`
 Export a trained model to ONNX (door-opener for an `ort`-based inference

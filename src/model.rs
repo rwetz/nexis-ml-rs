@@ -4,23 +4,27 @@
 // ║  2026                                ║
 // ╚══════════════════════════════════════╝
 
-//! The `train` command's model — a real MLP classifier built on
-//! [`burn`](https://github.com/tracel-ai/burn), generic over the backend:
-//! `[train] device` picks CPU (ndarray) or GPU (wgpu), both with autodiff.
-//! Loads a CSV when `[data] path` points at one (the "my spreadsheet, what
-//! predicts what" case), otherwise trains on a built-in synthetic two-blob
-//! dataset so `train` works out of the box. Drives the same `Run` lifecycle
-//! as the Python engine, so Nexis renders it identically.
+//! The `train` command's models, built on [`burn`](https://github.com/tracel-ai/burn)
+//! and generic over the backend (`[train] device` picks CPU/ndarray or
+//! GPU/wgpu, both with autodiff). The model is chosen from `[data] path`: a
+//! folder of class sub-folders trains a **CNN** over its images; a CSV (or
+//! no path → synthetic) trains a declarative-depth **MLP** over tabular rows.
+//! Both are configured in `train.toml` (`[model] hidden = 16 | [64, 32]` for
+//! the MLP; `conv1`/`conv2`/`hidden` for the CNN) rather than code, since the
+//! Rust engine can't run a user's `train.py`. Drives the same `Run` lifecycle
+//! as the Python engine, so Nexis renders runs from either identically.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use burn::backend::ndarray::NdArrayDevice;
 use burn::backend::wgpu::{Wgpu, WgpuDevice};
 use burn::backend::{Autodiff, NdArray};
 use burn::module::Module;
+use burn::nn::conv::{Conv2d, Conv2dConfig};
 use burn::nn::loss::CrossEntropyLossConfig;
-use burn::nn::{Linear, LinearConfig};
+use burn::nn::pool::{MaxPool2d, MaxPool2dConfig};
+use burn::nn::{Linear, LinearConfig, PaddingConfig2d};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::tensor::activation::relu;
 use burn::tensor::{
@@ -91,12 +95,31 @@ impl HiddenSpec {
             HiddenSpec::Layers(v) => v.clone(),
         }
     }
+
+    /// The dense-head width for the CNN (the single/first entry).
+    fn dense(&self) -> usize {
+        match self {
+            HiddenSpec::Scalar(n) => *n,
+            HiddenSpec::Layers(v) => v.first().copied().unwrap_or(64),
+        }
+    }
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 #[serde(default)]
 struct ModelCfg {
     hidden: HiddenSpec,
+    conv1: usize, // CNN: first conv channel count (image data)
+    conv2: usize, // CNN: second conv channel count
+}
+impl Default for ModelCfg {
+    fn default() -> Self {
+        Self {
+            hidden: HiddenSpec::default(),
+            conv1: 16,
+            conv2: 32,
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -429,28 +452,64 @@ fn prepare(project: &Path, root: &Root) -> std::io::Result<Prepared> {
     })
 }
 
-/// Pick the backend from the configured device and run training on it. The
-/// backend is a compile-time type, so we monomorphize `run_training` for each
-/// path rather than dispatching dynamically; the data prep is shared.
+/// Confusion matrix (rows = actual, cols = predicted) and the correct count
+/// for predictions against integer targets. Out-of-range labels are skipped
+/// defensively. Shared by the MLP and CNN validation loops.
+fn confusion(preds: &[i64], targets: &[usize], n_classes: usize) -> (Vec<Vec<u32>>, usize) {
+    let mut cm = vec![vec![0u32; n_classes]; n_classes];
+    let mut correct = 0usize;
+    for (p, &t) in preds.iter().zip(targets.iter()) {
+        let pred = *p as usize;
+        if pred == t {
+            correct += 1;
+        }
+        if t < n_classes && pred < n_classes {
+            cm[t][pred] += 1;
+        }
+    }
+    (cm, correct)
+}
+
+/// `[data] path` resolved to an image directory (a folder of class
+/// sub-folders) — the signal to train a CNN instead of the tabular MLP.
+/// `None` means tabular (a CSV path or no data path → synthetic).
+fn image_dir(project: &Path, root: &Root) -> Option<PathBuf> {
+    let full = project.join(root.data.path.as_ref()?);
+    full.is_dir().then_some(full)
+}
+
+/// Run `$f::<Backend>(args.., device, label, mem_probe)` on the GPU or CPU
+/// backend per `$want_gpu`. A macro because the backend is a type parameter
+/// (stable Rust has no generic closures) and both the MLP and CNN paths need
+/// the same CPU/GPU + memory-probe wiring.
+macro_rules! dispatch_backend {
+    ($f:ident, $want_gpu:expr, $($arg:expr),+ $(,)?) => {
+        if $want_gpu {
+            let device = WgpuDevice::default();
+            let mem_dev = device.clone();
+            $f::<Autodiff<Wgpu>>($($arg),+, device, "gpu", move || wgpu_mem_mb(&mem_dev))
+        } else {
+            $f::<Autodiff<NdArray>>($($arg),+, NdArrayDevice::default(), "cpu", || None)
+        }
+    };
+}
+
+/// Pick the model (tabular MLP or image CNN) from `[data] path`, then the
+/// backend from `[train] device`. The backend is a compile-time type, so the
+/// chosen `run_*` is monomorphized per backend rather than dispatched
+/// dynamically; the backend-independent data prep happens first.
 pub fn train(project: &Path, emitter: &Emitter) -> std::io::Result<i32> {
     let root = load_root(project);
-    let data = prepare(project, &root)?;
-    if want_gpu(&root.train.device, emitter) {
-        let device = WgpuDevice::default();
-        let mem_dev = device.clone();
-        run_training::<Autodiff<Wgpu>>(project, emitter, &root, data, device, "gpu", move || {
-            wgpu_mem_mb(&mem_dev)
-        })
-    } else {
-        run_training::<Autodiff<NdArray>>(
-            project,
-            emitter,
-            &root,
-            data,
-            NdArrayDevice::default(),
-            "cpu",
-            || None,
-        )
+    let want = want_gpu(&root.train.device, emitter);
+    match image_dir(project, &root) {
+        Some(dir) => {
+            let data = prepare_images(&dir, &root.train)?;
+            dispatch_backend!(run_cnn_training, want, project, emitter, &root, data)
+        }
+        None => {
+            let data = prepare(project, &root)?;
+            dispatch_backend!(run_training, want, project, emitter, &root, data)
+        }
     }
 }
 
@@ -539,17 +598,7 @@ fn run_training<B: AutodiffBackend>(
         // iter() converts the backend's int dtype (i64 on ndarray, i32 on
         // wgpu); to_vec() would reject the mismatch and silently drop preds.
         let preds: Vec<i64> = logits.argmax(1).into_data().iter::<i64>().collect();
-        let mut correct = 0usize;
-        let mut cm = vec![vec![0u32; n_classes]; n_classes];
-        for (p, &t) in preds.iter().zip(data.val_y.iter()) {
-            let pred = *p as usize;
-            if pred == t {
-                correct += 1;
-            }
-            if t < n_classes && pred < n_classes {
-                cm[t][pred] += 1;
-            }
-        }
+        let (cm, correct) = confusion(&preds, &data.val_y, n_classes);
         let acc = correct as f64 / data.val_y.len().max(1) as f64;
         run.log(&[("loss/val", vloss), ("acc/val", acc)], epoch);
         // GPU memory footprint, when the backend reports it (CPU → None).
@@ -591,6 +640,372 @@ fn run_training<B: AutodiffBackend>(
     Ok(0)
 }
 
+// ── image data + CNN ──────────────────────────────────────────────────
+
+const IMAGE_EXTS: [&str; 4] = ["png", "jpg", "jpeg", "bmp"];
+
+/// Backend-independent image dataset: grayscale pixels (row-major, 0..1) per
+/// image, shuffled and split into train/val, plus the class names and the
+/// (height, width) every image was loaded at.
+struct PreparedImages {
+    train_x: Vec<Vec<f32>>,
+    train_y: Vec<usize>,
+    val_x: Vec<Vec<f32>>,
+    val_y: Vec<usize>,
+    classes: Vec<String>,
+    height: usize,
+    width: usize,
+}
+
+/// (pixels per image, labels, class names, height, width) — the raw decoded
+/// dataset before shuffling/splitting.
+type LoadedImages = (Vec<Vec<f32>>, Vec<usize>, Vec<String>, usize, usize);
+
+fn has_image_ext(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Load every image under `dir/<class>/*` as single-channel grayscale,
+/// resized to the first image's size. Returns (pixels, labels, classes,
+/// height, width). Image size is taken from the first file, matching the
+/// Python `image` template's behavior.
+fn load_images(dir: &Path) -> std::io::Result<LoadedImages> {
+    let mut classes: Vec<String> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    classes.sort();
+    if classes.len() < 2 {
+        return Err(err(format!(
+            "need at least 2 class sub-folders in {} — found {classes:?}",
+            dir.display()
+        )));
+    }
+
+    let mut paths: Vec<(PathBuf, usize)> = Vec::new();
+    for (label, c) in classes.iter().enumerate() {
+        let mut files: Vec<PathBuf> = fs::read_dir(dir.join(c))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && has_image_ext(p))
+            .collect();
+        files.sort();
+        for f in files {
+            paths.push((f, label));
+        }
+    }
+    if paths.is_empty() {
+        return Err(err(format!(
+            "no images found under {}/<class>/",
+            dir.display()
+        )));
+    }
+
+    let first = image::open(&paths[0].0)
+        .map_err(|e| err(e.to_string()))?
+        .to_luma8();
+    let (width, height) = (first.width() as usize, first.height() as usize);
+
+    let mut imgs = Vec::with_capacity(paths.len());
+    let mut labels = Vec::with_capacity(paths.len());
+    for (path, label) in &paths {
+        let gray = image::open(path)
+            .map_err(|e| err(e.to_string()))?
+            .to_luma8();
+        let gray = if gray.width() as usize == width && gray.height() as usize == height {
+            gray
+        } else {
+            image::imageops::resize(
+                &gray,
+                width as u32,
+                height as u32,
+                image::imageops::FilterType::Triangle,
+            )
+        };
+        imgs.push(gray.pixels().map(|p| p.0[0] as f32 / 255.0).collect());
+        labels.push(*label);
+    }
+    Ok((imgs, labels, classes, height, width))
+}
+
+/// Load, shuffle, and split image data (no standardization — pixels are
+/// already 0..1). Validation rows come off the front, mirroring `prepare`.
+fn prepare_images(dir: &Path, cfg: &TrainCfg) -> std::io::Result<PreparedImages> {
+    let (mut imgs, mut labels, classes, height, width) = load_images(dir)?;
+
+    let mut rng = Rng(cfg.seed ^ 0xABCD);
+    for i in (1..imgs.len()).rev() {
+        let j = rng.below(i + 1);
+        imgs.swap(i, j);
+        labels.swap(i, j);
+    }
+    let n_val = ((imgs.len() as f64 * cfg.val_split) as usize)
+        .max(1)
+        .min(imgs.len() - 1);
+    let train_x = imgs.split_off(n_val);
+    let train_y = labels.split_off(n_val);
+    Ok(PreparedImages {
+        train_x,
+        train_y,
+        val_x: imgs,
+        val_y: labels,
+        classes,
+        height,
+        width,
+    })
+}
+
+fn to_image_tensor<B: Backend>(
+    imgs: &[Vec<f32>],
+    height: usize,
+    width: usize,
+    device: &B::Device,
+) -> Tensor<B, 4> {
+    let flat: Vec<f32> = imgs.iter().flatten().copied().collect();
+    Tensor::<B, 4>::from_data(
+        TensorData::new(flat, [imgs.len(), 1, height, width]),
+        device,
+    )
+}
+
+#[derive(Module, Debug)]
+struct Cnn<B: Backend> {
+    c1: Conv2d<B>,
+    c2: Conv2d<B>,
+    pool: MaxPool2d,
+    fc1: Linear<B>,
+    fc2: Linear<B>,
+}
+
+impl<B: Backend> Cnn<B> {
+    fn new(
+        conv1: usize,
+        conv2: usize,
+        hidden: usize,
+        n_classes: usize,
+        height: usize,
+        width: usize,
+        device: &B::Device,
+    ) -> Self {
+        // Same padding keeps the 3x3 convs spatial-dim-preserving; each 2x2
+        // pool halves them.
+        let c1 = Conv2dConfig::new([1, conv1], [3, 3])
+            .with_padding(PaddingConfig2d::Same)
+            .init(device);
+        let c2 = Conv2dConfig::new([conv1, conv2], [3, 3])
+            .with_padding(PaddingConfig2d::Same)
+            .init(device);
+        let pool = MaxPool2dConfig::new([2, 2]).init();
+        // Dry-run the feature stack to get the flattened size for any image
+        // size, instead of hand-computing the pooled dimensions.
+        let dummy = Tensor::<B, 4>::zeros([1, 1, height, width], device);
+        let d = Self::features(&c1, &c2, &pool, dummy).dims();
+        let flat = d[1] * d[2] * d[3];
+        Self {
+            c1,
+            c2,
+            pool,
+            fc1: LinearConfig::new(flat, hidden).init(device),
+            fc2: LinearConfig::new(hidden, n_classes).init(device),
+        }
+    }
+
+    fn features(c1: &Conv2d<B>, c2: &Conv2d<B>, pool: &MaxPool2d, x: Tensor<B, 4>) -> Tensor<B, 4> {
+        let x = pool.forward(relu(c1.forward(x)));
+        pool.forward(relu(c2.forward(x)))
+    }
+
+    fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 2> {
+        let feat = Self::features(&self.c1, &self.c2, &self.pool, x);
+        let flat: Tensor<B, 2> = feat.flatten(1, 3);
+        self.fc2.forward(relu(self.fc1.forward(flat)))
+    }
+}
+
+/// Compose a grid of validation images flagged by correctness (green border
+/// = right, red = wrong) and save it as the `image-grid` PNG artifact the
+/// panel renders. Pixels come from the grayscale-normalized val set; small
+/// images are integer-upscaled so thumbnails stay legible.
+fn save_image_grid(
+    path: &Path,
+    imgs: &[Vec<f32>],
+    height: usize,
+    width: usize,
+    preds: &[i64],
+    targets: &[usize],
+    n_max: usize,
+) -> std::io::Result<()> {
+    use image::{Rgb, RgbImage};
+    let n = imgs.len().min(n_max);
+    if n == 0 {
+        return Ok(());
+    }
+    let cols = n.min(8);
+    let rows = n.div_ceil(cols);
+    let scale = (32 / height.max(width).max(1)).max(1);
+    let (tw, th) = (width * scale, height * scale);
+    let (pad, border) = (3usize, 2usize);
+    let (cell_w, cell_h) = (tw + pad * 2, th + pad * 2);
+    let mut canvas = RgbImage::from_pixel(
+        (cols * cell_w) as u32,
+        (rows * cell_h) as u32,
+        Rgb([24, 24, 28]),
+    );
+    for i in 0..n {
+        let (row, col) = (i / cols, i % cols);
+        let (x0, y0) = (col * cell_w + pad, row * cell_h + pad);
+        let correct = preds.get(i).copied().unwrap_or(-1) == targets[i] as i64;
+        let bcol = if correct {
+            Rgb([52, 168, 108])
+        } else {
+            Rgb([220, 76, 76])
+        };
+        for py in 0..th {
+            for px in 0..tw {
+                let v = imgs[i][(py / scale) * width + (px / scale)].clamp(0.0, 1.0);
+                let g = (v * 255.0) as u8;
+                canvas.put_pixel((x0 + px) as u32, (y0 + py) as u32, Rgb([g, g, g]));
+            }
+        }
+        for t in 0..border {
+            for px in 0..tw {
+                canvas.put_pixel((x0 + px) as u32, (y0 + t) as u32, bcol);
+                canvas.put_pixel((x0 + px) as u32, (y0 + th - 1 - t) as u32, bcol);
+            }
+            for py in 0..th {
+                canvas.put_pixel((x0 + t) as u32, (y0 + py) as u32, bcol);
+                canvas.put_pixel((x0 + tw - 1 - t) as u32, (y0 + py) as u32, bcol);
+            }
+        }
+    }
+    canvas.save(path).map_err(|e| err(e.to_string()))
+}
+
+#[allow(clippy::single_range_in_vec_init)]
+fn run_cnn_training<B: AutodiffBackend>(
+    project: &Path,
+    emitter: &Emitter,
+    root: &Root,
+    data: PreparedImages,
+    device: B::Device,
+    device_label: &str,
+    mem_probe: impl Fn() -> Option<f64>,
+) -> std::io::Result<i32> {
+    let cfg = &root.train;
+    let n_classes = data.classes.len();
+    let (h, w) = (data.height, data.width);
+    let (conv1, conv2, hidden) = (
+        root.model.conv1,
+        root.model.conv2,
+        root.model.hidden.dense(),
+    );
+
+    let x_train = to_image_tensor::<B>(&data.train_x, h, w, &device);
+    let y_train = to_targets::<B>(&data.train_y, &device);
+    let x_val = to_image_tensor::<B>(&data.val_x, h, w, &device);
+
+    let mut model = Cnn::<B>::new(conv1, conv2, hidden, n_classes, h, w, &device);
+    let mut opt = AdamConfig::new().init();
+    let loss_fn = CrossEntropyLossConfig::new().init(&device);
+
+    let dir = run_store::new_run_dir(project, "image")?;
+    let config_json = json!({
+        "train": {
+            "epochs": cfg.epochs, "batch_size": cfg.batch_size, "lr": cfg.lr,
+            "val_split": cfg.val_split, "seed": cfg.seed, "device": cfg.device,
+        },
+        "model": {"conv1": conv1, "conv2": conv2, "hidden": hidden},
+        "engine": "nexis-ml-rs",
+        "derived": {"classes": data.classes, "task": "classification",
+                    "img_size": [h, w]},
+    });
+    let mut run = Run::start(emitter, dir, "image", config_json, cfg.epochs, device_label);
+    run.info(&format!(
+        "burn CNN (Rust engine, {device_label}): {} train / {} val images ({w}x{h}), {n_classes} classes, conv {conv1}/{conv2}, hidden={hidden}",
+        data.train_x.len(),
+        data.val_x.len(),
+    ));
+
+    let n_train = data.train_x.len();
+    let bs = cfg.batch_size.max(1);
+    let mut best_val = f64::INFINITY;
+
+    for epoch in 1..=cfg.epochs {
+        let mut start = 0;
+        while start < n_train {
+            let end = (start + bs).min(n_train);
+            let xb = x_train.clone().slice([start..end]);
+            let yb = y_train.clone().slice([start..end]);
+            let logits = model.forward(xb);
+            let loss = loss_fn.forward(logits, yb);
+            let loss_val = loss.clone().into_scalar().elem::<f64>();
+            let grads = loss.backward();
+            let gp = GradientsParams::from_grads(grads, &model);
+            model = opt.step(cfg.lr, model, gp);
+            run.log(&[("loss/train", loss_val)], epoch);
+            start = end;
+        }
+
+        if run.cancelled() {
+            break;
+        }
+
+        let logits = model.forward(x_val.clone());
+        let vloss = loss_fn
+            .forward(logits.clone(), to_targets::<B>(&data.val_y, &device))
+            .into_scalar()
+            .elem::<f64>();
+        let preds: Vec<i64> = logits.argmax(1).into_data().iter::<i64>().collect();
+        let (cm, correct) = confusion(&preds, &data.val_y, n_classes);
+        let acc = correct as f64 / data.val_y.len().max(1) as f64;
+        run.log(&[("loss/val", vloss), ("acc/val", acc)], epoch);
+        if let Some(mb) = mem_probe() {
+            run.log(&[("mem/gpu_mb", mb)], epoch);
+        }
+
+        let cm_path = run.artifacts_dir().join(format!("cm-epoch{epoch}.json"));
+        let cm_json = json!({"labels": data.classes, "matrix": cm});
+        let _ = fs::write(
+            &cm_path,
+            serde_json::to_string(&cm_json).unwrap_or_default(),
+        );
+        run.artifact("confusion-matrix", &cm_path);
+
+        let grid_path = run
+            .artifacts_dir()
+            .join(format!("samples-epoch{epoch}.png"));
+        if save_image_grid(&grid_path, &data.val_x, h, w, &preds, &data.val_y, 16).is_ok() {
+            run.artifact("image-grid", &grid_path);
+        }
+
+        if vloss < best_val {
+            best_val = vloss;
+            let ckpt = json!({
+                "classes": data.classes, "img_size": [h, w],
+                "conv1": conv1, "conv2": conv2, "hidden": hidden,
+            });
+            let _ = fs::write(
+                run.checkpoints_dir().join("best.json"),
+                serde_json::to_string_pretty(&ckpt).unwrap_or_default(),
+            );
+        }
+
+        run.epoch(epoch);
+        if run.cancelled() {
+            break;
+        }
+    }
+
+    run.info(&format!("best val loss: {best_val:.4}"));
+    let status = if run.cancelled() { "cancelled" } else { "ok" };
+    run.finish(status);
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,6 +1022,25 @@ mod tests {
         assert_eq!(list.hidden.layers(), vec![64, 16]);
         // default is a single hidden layer
         assert_eq!(HiddenSpec::default().layers(), vec![16]);
+    }
+
+    #[test]
+    fn confusion_counts_and_accuracy() {
+        let preds = [0i64, 1, 1, 0];
+        let targets = [0usize, 1, 0, 0];
+        let (cm, correct) = confusion(&preds, &targets, 2);
+        assert_eq!(correct, 3);
+        // rows = actual, cols = predicted
+        assert_eq!(cm[0], vec![2, 1]);
+        assert_eq!(cm[1], vec![0, 1]);
+    }
+
+    #[test]
+    fn image_ext_detection_is_case_insensitive() {
+        assert!(has_image_ext(Path::new("a/b.PNG")));
+        assert!(has_image_ext(Path::new("x.jpeg")));
+        assert!(!has_image_ext(Path::new("x.csv")));
+        assert!(!has_image_ext(Path::new("noext")));
     }
 
     #[test]

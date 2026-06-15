@@ -1,6 +1,6 @@
 [package]
 name = "nexis-ml-rs"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Python-free, single-binary ML engine for the Nexis terminal (Phase 3) — same NDJSON protocol and run store as nexis-ml."
 license = "Apache-2.0"
@@ -21,6 +21,9 @@ burn = { version = "0.21.0", default-features = false, features = ["std", "ndarr
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+# Decode folder-per-class images for the CNN path; png also encodes the
+# sample-grid artifact. Lean feature set — no extra codecs pulled in.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
 
 [profile.release]
 opt-level = 3

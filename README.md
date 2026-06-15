@@ -8,22 +8,22 @@ the Python [`nexis-ml`](https://github.com/rwetz/nexis-ml) engine, so Nexis
 renders runs from either with zero changes. The goal: an LSP-style
 downloadable engine for machines without a Python/PyTorch toolchain.
 
-> **Status: real `burn` MLP, CPU *and* GPU.** Protocol, run store, and CLI
-> are complete and verified end-to-end (a Rust-produced run is read by the
-> Python `nexis-ml runs`). `train` runs a true MLP classifier on
-> [`burn`](https://github.com/tracel-ai/burn) — pick the backend with
-> `[train] device` (`auto`/`cpu`/`gpu`): GPU runs on burn's **wgpu** backend
-> (Vulkan/DX12/Metal, no vendor toolchain), CPU on ndarray; both with
-> autodiff. Load a CSV via `[data] path` (the "my spreadsheet" case) or fall
-> back to built-in synthetic data. Next: declarative MLP/CNN presets — see
-> [PLAN.md](PLAN.md).
+> **Status: real `burn` MLP + CNN, CPU *and* GPU.** Protocol, run store, and
+> CLI are complete and verified end-to-end (a Rust-produced run is read by the
+> Python `nexis-ml runs`). `train` runs on [`burn`](https://github.com/tracel-ai/burn) —
+> pick the backend with `[train] device` (`auto`/`cpu`/`gpu`): GPU runs on
+> burn's **wgpu** backend (Vulkan/DX12/Metal, no vendor toolchain), CPU on
+> ndarray; both with autodiff. The model is **declared in `train.toml`**: a
+> CSV `[data] path` (or none → synthetic) trains a variable-depth MLP; a
+> folder of class sub-folders trains a CNN over its images. Next: `export
+> --onnx`, then Nexis download/detect — see [PLAN.md](PLAN.md).
 
 ## Build & run
 
 ```sh
 cargo build --release           # produces target/release/nexis-ml(.exe)
 
-nexis-ml --version              # → "nexis-ml 0.3.0" (Nexis-detectable)
+nexis-ml --version              # → "nexis-ml 0.4.0" (Nexis-detectable)
 nexis-ml env                    # one-line JSON capability report (backend: cpu|wgpu)
 nexis-ml new my-run             # scaffold a train.toml (device = "auto")
 nexis-ml train my-run           # train; writes .nexis-ml/runs/<id>/
@@ -43,6 +43,21 @@ Set `[train] device` in `train.toml`:
 The GPU path uses burn's **wgpu** backend (Vulkan/DX12/Metal/OpenGL) — no
 CUDA or vendor toolchain required, so the same binary uses the GPU on any
 modern machine. GPU runs emit a per-epoch `mem/gpu_mb` footprint metric.
+
+### The model (declarative)
+
+The model is described in `train.toml`, not code — chosen by what `[data]
+path` points at:
+
+| `[data] path` | model | `[model]` keys |
+|---|---|---|
+| a `.csv` (or unset → synthetic) | tabular **MLP** | `hidden = 16` or `hidden = [64, 32]` |
+| a folder of class sub-folders | image **CNN** | `conv1`, `conv2`, `hidden` |
+
+`hidden` as a list sets the MLP's hidden-layer widths (any depth; an empty
+list is a bare linear classifier). The CNN decodes folder-per-class images to
+grayscale (PNG/JPEG/BMP, resized to the first image's size) and emits a
+per-epoch confusion matrix plus an `image-grid` PNG of sample predictions.
 
 The binary is named `nexis-ml` (not `nexis-ml-rs`) so Nexis detects and
 spawns it exactly like the Python engine — the two are never on `PATH`
@@ -74,7 +89,7 @@ Stop and Pause buttons work against either engine.
 | `src/protocol.rs` | NDJSON emitter (protocol v1) |
 | `src/run_store.rs` | run directory + atomic file writes (UTC stamp, no deps) |
 | `src/harness.rs` | `Run` lifecycle + stdin control watcher (cancel/pause/resume) |
-| `src/model.rs` | the `train` command's `burn` MLP (CPU/GPU) + device selection + CSV/synthetic data |
+| `src/model.rs` | the `train` command's `burn` MLP + CNN (CPU/GPU), device selection, CSV/synthetic + image data |
 | `src/main.rs` | CLI (`--version` / `env` / `new` / `train`) |
 
 ## License
