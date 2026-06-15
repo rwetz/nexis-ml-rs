@@ -8,7 +8,7 @@
 //! speaking the same NDJSON protocol and writing the same run store as the
 //! Python `nexis-ml`, so Nexis consumes either with no changes.
 //!
-//! Commands: --version | env | new [dir] | train [dir] | export --onnx [dir]
+//! Commands: --version | env | new <template> [dir] | train [dir] | export --onnx [dir]
 //! Exit codes: 0 ok, 1 error, 2 usage.
 
 mod harness;
@@ -98,9 +98,10 @@ fn cmd_env() -> i32 {
     0
 }
 
-const DEFAULT_TOML: &str = "\
-# nexis-ml-rs (Phase 3 engine) — a linear classifier on synthetic data.
-# Edit and re-run `nexis-ml train`.
+const TABULAR_TOML: &str = "\
+# nexis-ml-rs (Phase 3 engine) — an MLP over tabular data.
+# Point [data] at a CSV, or leave it for built-in synthetic data, then
+# run `nexis-ml train`.
 
 [train]
 epochs = 20
@@ -108,31 +109,65 @@ batch_size = 16
 lr = 0.2
 val_split = 0.2
 seed = 42
-samples = 240        # synthetic two-blob points to generate
+samples = 240        # synthetic two-blob points (when no [data] path)
 device = \"auto\"       # auto | cpu | gpu  (auto uses the GPU via wgpu when present)
+
+[model]
+hidden = [16]        # MLP hidden-layer widths (a single int also works)
 ";
 
+const IMAGE_TOML: &str = "\
+# nexis-ml-rs (Phase 3 engine) — a small CNN over folder-per-class images.
+# Put images in data/<class>/*.png (one folder per class), then run
+# `nexis-ml train`.
+
+[train]
+epochs = 12
+batch_size = 16
+lr = 0.01
+val_split = 0.2
+seed = 42
+device = \"auto\"       # auto | cpu | gpu
+
+[data]
+path = \"data\"         # a folder of class sub-folders (one per class)
+
+[model]
+conv1 = 16
+conv2 = 32
+hidden = 64
+";
+
+/// `new <template> [dir]` — matches the Python engine's argument order
+/// (template first; dir defaults to `./<template>`). Scaffolds the
+/// template's `train.toml`. The Rust engine supports `tabular` and `image`;
+/// `textgen` is Python-only.
 fn cmd_new(pos: &[String]) -> i32 {
-    let dir = pos
-        .first()
-        .map(String::as_str)
-        .unwrap_or("nexis-ml-project");
+    let template = pos.first().map(String::as_str).unwrap_or("tabular");
+    let dir = pos.get(1).map(String::as_str).unwrap_or(template);
+    let toml = match template {
+        "tabular" => TABULAR_TOML,
+        "image" => IMAGE_TOML,
+        other => {
+            eprintln!("error: unknown template '{other}' (this engine supports: tabular, image)");
+            return 2;
+        }
+    };
     let path = Path::new(dir);
     if let Err(e) = std::fs::create_dir_all(path) {
         eprintln!("error: {e}");
         return 1;
     }
-    let toml_path = path.join("train.toml");
-    if let Err(e) = std::fs::write(&toml_path, DEFAULT_TOML) {
+    if let Err(e) = std::fs::write(path.join("train.toml"), toml) {
         eprintln!("error: {e}");
         return 1;
     }
     // Protocol mode keeps stdout clean (humans read stderr).
     if std::env::var(ENV_FLAG).as_deref() == Ok("1") {
-        eprintln!("created project at {dir}");
+        eprintln!("created {template} project at {dir}");
         return 0;
     }
-    println!("created project at {dir}\nnext:\n  cd {dir}\n  nexis-ml train");
+    println!("created {template} project at {dir}\nnext:\n  cd {dir}\n  nexis-ml train");
     0
 }
 

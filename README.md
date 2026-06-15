@@ -23,9 +23,9 @@ downloadable engine for machines without a Python/PyTorch toolchain.
 ```sh
 cargo build --release           # produces target/release/nexis-ml(.exe)
 
-nexis-ml --version              # → "nexis-ml 0.5.0" (Nexis-detectable)
+nexis-ml --version              # → "nexis-ml 0.5.1" (Nexis-detectable)
 nexis-ml env                    # one-line JSON capability report (backend: cpu|wgpu)
-nexis-ml new my-run             # scaffold a train.toml (device = "auto")
+nexis-ml new tabular my-run     # scaffold a project (templates: tabular | image)
 nexis-ml train my-run           # train; writes .nexis-ml/runs/<id>/
 nexis-ml --nexis-protocol train my-run   # stream NDJSON protocol on stdout
 nexis-ml export --onnx my-run   # train the MLP and write my-run/model.onnx
