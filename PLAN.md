@@ -84,10 +84,16 @@ argmax matches the burn model **exactly** (48/48 val rows) on a `[16, 8]`
 MLP. CNN/ONNX export is a follow-up (Conv/MaxPool graph) — `export --onnx`
 on an image project errors clearly.
 
-### M6 — Nexis integration (download + detect)
-Teach Nexis to download this binary to a managed dir and detect it
-(`--version`) like an LSP server, then spawn it via the existing `ml_*`
-commands. No Nexis protocol changes needed — only a download/locate path.
+### M6 — Nexis integration (download + detect) ✅ (2026-06-15, app-side)
+Implemented in the Nexis app (`src-tauri/src/modules/ml.rs` +
+`src/modules/ml`): `ml_managed_engine_path` resolves a managed engine path
+under the app's local data dir, and the panel's detection appends it to the
+`--version` candidate list, so a standalone engine placed/downloaded there is
+found and spawned via the existing `ml_*` commands (no protocol changes).
+`ml_download` fetches a binary over https into that dir, marks it executable,
+and verifies it via `--version` — the "no Python on this machine" path,
+mirroring how an LSP server is fetched. Remaining hookup: a published
+release URL for this repo's binary + a panel "download engine" button.
 
 ## Non-goals (carried from ML_SUITE.md)
 No cloud, no distributed training, no model zoo. Small models, small data,
