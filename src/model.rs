@@ -547,6 +547,7 @@ fn run_training<B: AutodiffBackend>(
     mem_probe: impl Fn() -> Option<f64>,
 ) -> std::io::Result<i32> {
     let cfg = &root.train;
+    B::seed(&device, cfg.seed); // reproducible weight init (data shuffle is seeded separately)
     let n_features = data.feature_names.len();
     let n_classes = data.classes.len();
 
@@ -900,6 +901,7 @@ fn run_cnn_training<B: AutodiffBackend>(
     mem_probe: impl Fn() -> Option<f64>,
 ) -> std::io::Result<i32> {
     let cfg = &root.train;
+    B::seed(&device, cfg.seed); // reproducible weight init (data shuffle is seeded separately)
     let n_classes = data.classes.len();
     let (h, w) = (data.height, data.width);
     let (conv1, conv2, hidden) = (
@@ -1013,6 +1015,7 @@ fn run_cnn_training<B: AutodiffBackend>(
 fn fit_mlp(data: &Prepared, cfg: &TrainCfg, hidden: &[usize]) -> Mlp<Autodiff<NdArray>> {
     type B = Autodiff<NdArray>;
     let device = NdArrayDevice::default();
+    B::seed(&device, cfg.seed); // reproducible weight init → reproducible export
     let n_features = data.feature_names.len();
     let n_classes = data.classes.len();
     let x = to_tensor::<B>(&data.train_x, n_features, &device);
