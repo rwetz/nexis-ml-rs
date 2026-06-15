@@ -1,0 +1,68 @@
+# Builds the standalone engine for Windows / macOS / Linux and attaches the
+# binaries to the GitHub Release when a `v*` tag is pushed.
+#
+# The Nexis ML Lab panel's "Download standalone engine" button fetches
+# `releases/latest/download/<asset>`, so the asset names below MUST match
+# `ml_engine_release_url` in the Nexis app:
+#   windows x64 → nexis-ml-windows-x64.exe
+#   macOS arm64 → nexis-ml-macos-arm64
+#   macOS x64   → nexis-ml-macos-x64
+#   linux x64   → nexis-ml-linux-x64
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  # Create the release once (idempotent) so the matrix uploads don't race to
+  # create it.
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" --generate-notes --verify-tag \
+            || echo "release already exists"
+
+  build:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            bin: nexis-ml.exe
+            asset: nexis-ml-windows-x64.exe
+          - os: macos-latest
+            bin: nexis-ml
+            asset: nexis-ml-macos-arm64
+          - os: macos-13
+            bin: nexis-ml
+            asset: nexis-ml-macos-x64
+          - os: ubuntu-latest
+            bin: nexis-ml
+            asset: nexis-ml-linux-x64
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.asset }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (release)
+        run: cargo build --release --locked
+      - name: Stage asset
+        shell: bash
+        run: cp "target/release/${{ matrix.bin }}" "${{ matrix.asset }}"
+      - name: Upload to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" "${{ matrix.asset }}" --clobber
