@@ -118,8 +118,9 @@ hidden = [16]        # MLP hidden-layer widths (a single int also works)
 
 const IMAGE_TOML: &str = "\
 # nexis-ml-rs (Phase 3 engine) — a small CNN over folder-per-class images.
-# Put images in data/<class>/*.png (one folder per class), then run
-# `nexis-ml train`.
+# Ships four example pattern classes under data/ so `nexis-ml train` works
+# right away; replace them with your own data/<class>/*.png (one folder per
+# class) when you're ready.
 
 [train]
 epochs = 12
@@ -140,7 +141,8 @@ hidden = 64
 
 /// `new <template> [dir]` — matches the Python engine's argument order
 /// (template first; dir defaults to `./<template>`). Scaffolds the
-/// template's `train.toml`. The Rust engine supports `tabular` and `image`;
+/// template's `train.toml`, plus example images for `image` so it trains
+/// out of the box. The Rust engine supports `tabular` and `image`;
 /// `textgen` is Python-only.
 fn cmd_new(pos: &[String]) -> i32 {
     let template = pos.first().map(String::as_str).unwrap_or("tabular");
@@ -162,6 +164,14 @@ fn cmd_new(pos: &[String]) -> i32 {
         eprintln!("error: {e}");
         return 1;
     }
+    // The image template ships example data so `train` works out of the box,
+    // matching the Python engine (the tabular template uses synthetic data).
+    if template == "image" {
+        if let Err(e) = write_example_images(&path.join("data")) {
+            eprintln!("error: writing example images: {e}");
+            return 1;
+        }
+    }
     // Protocol mode keeps stdout clean (humans read stderr).
     if std::env::var(ENV_FLAG).as_deref() == Ok("1") {
         eprintln!("created {template} project at {dir}");
@@ -169,6 +179,54 @@ fn cmd_new(pos: &[String]) -> i32 {
     }
     println!("created {template} project at {dir}\nnext:\n  cd {dir}\n  nexis-ml train");
     0
+}
+
+/// Generate a tiny folder-per-class image dataset under `data_dir` so
+/// `new image` trains out of the box — four visually distinct grayscale
+/// pattern classes (horizontal / vertical / diagonal stripes + a
+/// checkerboard), mirroring the Python engine's example data. Deterministic
+/// (a fixed SplitMix64, no RNG dependency) and small enough that a tiny CNN
+/// separates the classes within a few epochs.
+fn write_example_images(data_dir: &Path) -> std::io::Result<()> {
+    const SIZE: u32 = 24;
+    const PER_CLASS: u32 = 36;
+    let classes = ["horizontal", "vertical", "diagonal", "checker"];
+    let mut state: u64 = 7;
+    let mut rand = |n: u32| -> u32 {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        ((z ^ (z >> 31)) % u64::from(n)) as u32
+    };
+    for (ci, cls) in classes.iter().enumerate() {
+        let cdir = data_dir.join(cls);
+        std::fs::create_dir_all(&cdir)?;
+        for i in 0..PER_CLASS {
+            let period = 3 + rand(3); // 3..=5
+            let phase = rand(period);
+            let cell = 2 + rand(3); // 2..=4
+            let on_w = (period / 2).max(1);
+            let mut img = image::GrayImage::new(SIZE, SIZE);
+            for y in 0..SIZE {
+                for x in 0..SIZE {
+                    let on = match ci {
+                        0 => (y + phase) % period < on_w,        // horizontal stripes
+                        1 => (x + phase) % period < on_w,        // vertical stripes
+                        2 => (x + y + phase) % period < on_w,    // diagonal stripes
+                        _ => ((x / cell) + (y / cell)) % 2 == 0, // checkerboard
+                    };
+                    let base: i32 = if on { 220 } else { 30 };
+                    let noise = rand(37) as i32 - 18; // small ±18 jitter
+                    let v = (base + noise).clamp(0, 255) as u8;
+                    img.put_pixel(x, y, image::Luma([v]));
+                }
+            }
+            img.save(cdir.join(format!("img_{i:03}.png")))
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        }
+    }
+    Ok(())
 }
 
 fn cmd_train(pos: &[String], emitter: &Emitter) -> i32 {

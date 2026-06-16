@@ -521,6 +521,20 @@ macro_rules! dispatch_backend {
 /// dynamically; the backend-independent data prep happens first.
 pub fn train(project: &Path, emitter: &Emitter) -> std::io::Result<i32> {
     let root = load_root(project);
+    // A set-but-missing `[data] path` is a user mistake, not a cue to fall
+    // back to synthetic data — that fallback silently trains the *wrong*
+    // model (e.g. `new image` with no images yet would quietly become a
+    // tabular run). Only an *unset* path means "use synthetic".
+    if let Some(p) = &root.data.path {
+        let full = project.join(p);
+        if !full.is_file() && !full.is_dir() {
+            return Err(err(format!(
+                "[data] path \"{p}\" not found — expected a CSV file or a folder \
+                 of class sub-folders (one per class). Add your data there, or \
+                 remove [data] path to train on built-in synthetic data."
+            )));
+        }
+    }
     let want = want_gpu(&root.train.device, emitter);
     match image_dir(project, &root) {
         Some(dir) => {

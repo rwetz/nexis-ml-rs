@@ -6,6 +6,21 @@ This engine speaks the same protocol and writes the same run store as the
 Python [`nexis-ml`](https://github.com/rwetz/nexis-ml) — see
 [PLAN.md](PLAN.md) for the milestone-by-milestone story.
 
+## [0.6.0] — 2026-06-16
+
+### Added
+- **`new image` ships example data** — scaffolds four pattern classes
+  (horizontal / vertical / diagonal stripes + a checkerboard; 144 grayscale
+  PNGs under `data/`) so `new image` → `train` trains a CNN out of the box,
+  matching the Python engine. Replace them with your own `data/<class>/*.png`
+  when you're ready.
+
+### Fixed
+- A **set-but-missing `[data] path`** now errors clearly instead of silently
+  falling back to synthetic tabular data — that fallback quietly trained the
+  *wrong* model (e.g. `new image` with no images became a tabular run). Only
+  an *unset* `[data] path` means "use built-in synthetic data".
+
 ## [0.5.2] — 2026-06-15
 
 ### Added
