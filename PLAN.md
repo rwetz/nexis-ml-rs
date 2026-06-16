@@ -92,8 +92,11 @@ under the app's local data dir, and the panel's detection appends it to the
 found and spawned via the existing `ml_*` commands (no protocol changes).
 `ml_download` fetches a binary over https into that dir, marks it executable,
 and verifies it via `--version` — the "no Python on this machine" path,
-mirroring how an LSP server is fetched. Remaining hookup: a published
-release URL for this repo's binary + a panel "download engine" button.
+mirroring how an LSP server is fetched. **Download hookup shipped**
+(2026-06-16): the app resolves the per-OS/arch GitHub release asset
+(`ml_engine_release_url`) and the setup card has a one-click "Download
+standalone engine" button that fetches, verifies, and then runs this engine.
+**Phase 3 (M1–M6) is complete.**
 
 ## Non-goals (carried from ML_SUITE.md)
 No cloud, no distributed training, no model zoo. Small models, small data,

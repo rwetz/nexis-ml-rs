@@ -8,15 +8,17 @@ the Python [`nexis-ml`](https://github.com/rwetz/nexis-ml) engine, so Nexis
 renders runs from either with zero changes. The goal: an LSP-style
 downloadable engine for machines without a Python/PyTorch toolchain.
 
-> **Status: real `burn` MLP + CNN, CPU *and* GPU.** Protocol, run store, and
+> **Status: Phase 3 complete (M1–M6) — real `burn` MLP + CNN (CPU *and* GPU), ONNX export, Nexis-integrated.** Protocol, run store, and
 > CLI are complete and verified end-to-end (a Rust-produced run is read by the
 > Python `nexis-ml runs`). `train` runs on [`burn`](https://github.com/tracel-ai/burn) —
 > pick the backend with `[train] device` (`auto`/`cpu`/`gpu`): GPU runs on
 > burn's **wgpu** backend (Vulkan/DX12/Metal, no vendor toolchain), CPU on
 > ndarray; both with autodiff. The model is **declared in `train.toml`**: a
 > CSV `[data] path` (or none → synthetic) trains a variable-depth MLP; a
-> folder of class sub-folders trains a CNN over its images. Next: `export
-> --onnx`, then Nexis download/detect — see [PLAN.md](PLAN.md).
+> folder of class sub-folders trains a CNN over its images. `export --onnx`
+> (tabular MLP) and Nexis download + detect are both shipped, so the panel
+> can fetch and run this engine on a machine with no Python — see
+> [PLAN.md](PLAN.md). (CNN ONNX export is the one remaining follow-up.)
 
 ## Build & run
 
