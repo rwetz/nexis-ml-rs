@@ -5,9 +5,8 @@
 # `releases/latest/download/<asset>`, so the asset names below MUST match
 # `ml_engine_release_url` in the Nexis app:
 #   windows x64 → nexis-ml-windows-x64.exe
-#   macOS arm64 → nexis-ml-macos-arm64
-#   macOS x64   → nexis-ml-macos-x64
 #   linux x64   → nexis-ml-linux-x64
+# (macOS builds are deferred — see the matrix note below.)
 name: release
 
 on:
@@ -41,15 +40,12 @@ jobs:
           - os: windows-latest
             bin: nexis-ml.exe
             asset: nexis-ml-windows-x64.exe
-          - os: macos-latest
-            bin: nexis-ml
-            asset: nexis-ml-macos-arm64
-          - os: macos-13
-            bin: nexis-ml
-            asset: nexis-ml-macos-x64
           - os: ubuntu-latest
             bin: nexis-ml
             asset: nexis-ml-linux-x64
+          # macOS builds deferred — the macos-13 (Intel) runner queued for
+          # hours and left releases hanging. Revisit later (likely a single
+          # arm64 runner cross-compiling x64). Mac users use the Python engine.
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.asset }}
     steps:
