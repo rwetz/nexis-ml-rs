@@ -116,6 +116,7 @@ impl<'a> Run<'a> {
             "startedAt": started_at,
         });
         dir.append_event(&event);
+        dir.flush(); // persist the run-started line before any epoch work
         emitter.emit(event);
         emitter.console(&format!("run {} started", dir.run_id()));
         // In protocol mode, watch stdin for cancel/pause/resume commands
@@ -198,6 +199,7 @@ impl<'a> Run<'a> {
             "of": self.total_epochs,
         });
         self.dir.append_event(&event);
+        self.dir.flush(); // epoch boundary: persist this epoch's buffered events
         self.emitter.emit(event);
         let latest: Vec<String> = self
             .last_values
@@ -269,6 +271,7 @@ impl<'a> Run<'a> {
             "summary": summary,
         });
         self.dir.append_event(&event);
+        self.dir.flush(); // final flush: persist the tail of the run
         self.emitter.emit(event);
         self.emitter
             .console(&format!("run {} finished: {status}", self.dir.run_id()));

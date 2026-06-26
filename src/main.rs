@@ -110,7 +110,7 @@ lr = 0.2
 val_split = 0.2
 seed = 42
 samples = 240        # synthetic two-blob points (when no [data] path)
-device = \"auto\"       # auto | cpu | gpu  (auto uses the GPU via wgpu when present)
+device = \"auto\"       # auto | cpu | gpu  (auto = CPU; set gpu to opt into wgpu)
 
 [model]
 hidden = [16]        # MLP hidden-layer widths (a single int also works)
@@ -128,7 +128,7 @@ batch_size = 16
 lr = 0.01
 val_split = 0.2
 seed = 42
-device = \"auto\"       # auto | cpu | gpu
+device = \"auto\"       # auto | cpu | gpu  (auto = CPU; set gpu to opt into wgpu)
 
 [data]
 path = \"data\"         # a folder of class sub-folders (one per class)
@@ -223,7 +223,7 @@ fn write_example_images(data_dir: &Path) -> std::io::Result<()> {
                 }
             }
             img.save(cdir.join(format!("img_{i:03}.png")))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
     }
     Ok(())

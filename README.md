@@ -25,12 +25,20 @@ downloadable engine for machines without a Python/PyTorch toolchain.
 ```sh
 cargo build --release           # produces target/release/nexis-ml(.exe)
 
-nexis-ml --version              # → "nexis-ml 0.5.2" (Nexis-detectable)
+nexis-ml --version              # → "nexis-ml 0.7.0" (Nexis-detectable)
 nexis-ml env                    # one-line JSON capability report (backend: cpu|wgpu)
 nexis-ml new tabular my-run     # scaffold a project (templates: tabular | image)
 nexis-ml train my-run           # train; writes .nexis-ml/runs/<id>/
 nexis-ml --nexis-protocol train my-run   # stream NDJSON protocol on stdout
 nexis-ml export --onnx my-run   # train the MLP and write my-run/model.onnx
+```
+
+The shipped binary targets a portable CPU baseline. If you're building only
+for your own machine, a native-tuned build lets the CPU backend use your
+processor's SIMD (AVX2/AVX-512):
+
+```sh
+RUSTFLAGS="-C target-cpu=native" cargo build --release   # local builds only — not portable
 ```
 
 ### CPU or GPU
@@ -39,9 +47,15 @@ Set `[train] device` in `train.toml`:
 
 | value | backend |
 |---|---|
-| `auto` (default) | GPU via wgpu when an adapter is present, else CPU |
-| `gpu` / `cuda` / `wgpu` | GPU via wgpu (warns and falls back to CPU if none) |
+| `auto` (default) | ndarray CPU backend — fastest for the small models this engine trains |
 | `cpu` | ndarray CPU backend |
+| `gpu` / `cuda` / `wgpu` | GPU via wgpu (warns and falls back to CPU if none) |
+
+`auto` trains on **CPU** on purpose: for the model sizes this engine builds
+(small MLPs and a 2-conv CNN) the ndarray backend beats wgpu, whose
+per-process init + adapter probe + kernel autotune (seconds) dwarfs the
+actual training. The GPU is **opt-in** — set `device = "gpu"`, where it pays
+off only on larger workloads.
 
 The GPU path uses burn's **wgpu** backend (Vulkan/DX12/Metal/OpenGL) — no
 CUDA or vendor toolchain required, so the same binary uses the GPU on any

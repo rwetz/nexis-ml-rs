@@ -340,6 +340,19 @@ fn to_targets<B: Backend>(labels: &[usize], device: &B::Device) -> Tensor<B, 1, 
     Tensor::<B, 1, Int>::from_data(TensorData::new(ints, [labels.len()]), device)
 }
 
+/// A seeded permutation of `0..n` as a 1-D index tensor, used to reshuffle the
+/// row order each epoch via `Tensor::select` (one on-device gather per epoch)
+/// without re-uploading the data. Seeding it from the run seed + epoch keeps
+/// the shuffle reproducible while varying the order across epochs.
+fn permutation<B: Backend>(n: usize, seed: u64, device: &B::Device) -> Tensor<B, 1, Int> {
+    let mut idx: Vec<i64> = (0..n as i64).collect();
+    let mut rng = Rng(seed);
+    for i in (1..n).rev() {
+        idx.swap(i, rng.below(i + 1));
+    }
+    Tensor::<B, 1, Int>::from_data(TensorData::new(idx, [n]), device)
+}
+
 // ── device selection ──────────────────────────────────────────────────
 
 /// Probe for a usable wgpu adapter without aborting the process. The wgpu
@@ -361,8 +374,8 @@ pub(crate) fn gpu_available() -> bool {
 
 /// Resolve the `[train] device` preference to a backend choice. `cpu` (and
 /// unknown values) use CPU; `gpu`/`cuda`/`wgpu` use the GPU when present
-/// (warning on fallback); `auto` (or empty) silently prefers the GPU. Keeps
-/// the same vocabulary as the Python engine's `device`.
+/// (warning on fallback); `auto` (or empty) uses CPU. Keeps the same
+/// vocabulary as the Python engine's `device`.
 fn want_gpu(pref: &str, emitter: &Emitter) -> bool {
     match pref.trim().to_ascii_lowercase().as_str() {
         "cpu" => false,
@@ -376,7 +389,12 @@ fn want_gpu(pref: &str, emitter: &Emitter) -> bool {
                 false
             }
         }
-        "auto" | "" => gpu_available(),
+        // `auto` trains on CPU: the models this engine builds (small MLPs and
+        // a 2-conv CNN) run faster on the ndarray CPU backend than on wgpu,
+        // whose per-process init + adapter probe + kernel autotune (seconds)
+        // dwarfs the actual training. The GPU is opt-in via an explicit
+        // `gpu`/`cuda`/`wgpu`, where it pays off only on larger workloads.
+        "auto" | "" => false,
         other => {
             emitter.console(&format!("note: unknown device \"{other}\" — using CPU"));
             false
@@ -601,22 +619,34 @@ fn run_training<B: AutodiffBackend>(
 
     let n_train = data.train_x.len();
     let bs = cfg.batch_size.max(1);
+    let y_val = to_targets::<B>(&data.val_y, &device); // hoisted: identical every epoch
     let mut best_val = f64::INFINITY;
 
     for epoch in 1..=cfg.epochs {
-        // Contiguous minibatches over the (once-shuffled) training tensor.
+        // Reshuffle the row order each epoch (one on-device gather) so the
+        // minibatches differ across epochs — standard SGD, better convergence
+        // than the old fixed once-shuffled order. The train loss is read only
+        // on the final minibatch: on the lazy wgpu backend an `into_scalar()`
+        // forces a GPU→CPU sync, so doing it per step (as before) serializes
+        // the pipeline. One read per epoch keeps a `loss/train` metric without
+        // the per-step stall or an extra full-set forward.
+        let perm = permutation::<B>(n_train, cfg.seed.wrapping_add(epoch as u64), &device);
+        let x_epoch = x_train.clone().select(0, perm.clone());
+        let y_epoch = y_train.clone().select(0, perm);
         let mut start = 0;
+        let mut tloss = 0.0;
         while start < n_train {
             let end = (start + bs).min(n_train);
-            let xb = x_train.clone().slice([start..end]);
-            let yb = y_train.clone().slice([start..end]);
+            let xb = x_epoch.clone().slice([start..end]);
+            let yb = y_epoch.clone().slice([start..end]);
             let logits = model.forward(xb);
             let loss = loss_fn.forward(logits, yb);
-            let loss_val = loss.clone().into_scalar().elem::<f64>();
+            if end == n_train {
+                tloss = loss.clone().into_scalar().elem::<f64>();
+            }
             let grads = loss.backward();
             let gp = GradientsParams::from_grads(grads, &model);
             model = opt.step(cfg.lr, model, gp);
-            run.log(&[("loss/train", loss_val)], epoch);
             start = end;
         }
 
@@ -628,7 +658,7 @@ fn run_training<B: AutodiffBackend>(
         // Validation.
         let logits = model.forward(x_val.clone());
         let vloss = loss_fn
-            .forward(logits.clone(), to_targets::<B>(&data.val_y, &device))
+            .forward(logits.clone(), y_val.clone())
             .into_scalar()
             .elem::<f64>();
         // iter() converts the backend's int dtype (i64 on ndarray, i32 on
@@ -636,7 +666,10 @@ fn run_training<B: AutodiffBackend>(
         let preds: Vec<i64> = logits.argmax(1).into_data().iter::<i64>().collect();
         let (cm, correct) = confusion(&preds, &data.val_y, n_classes);
         let acc = correct as f64 / data.val_y.len().max(1) as f64;
-        run.log(&[("loss/val", vloss), ("acc/val", acc)], epoch);
+        run.log(
+            &[("loss/train", tloss), ("loss/val", vloss), ("acc/val", acc)],
+            epoch,
+        );
         // GPU memory footprint, when the backend reports it (CPU → None).
         if let Some(mb) = mem_probe() {
             run.log(&[("mem/gpu_mb", mb)], epoch);
@@ -952,21 +985,28 @@ fn run_cnn_training<B: AutodiffBackend>(
 
     let n_train = data.train_x.len();
     let bs = cfg.batch_size.max(1);
+    let y_val = to_targets::<B>(&data.val_y, &device); // hoisted: identical every epoch
     let mut best_val = f64::INFINITY;
 
     for epoch in 1..=cfg.epochs {
+        // Per-epoch reshuffle + final-minibatch loss read (see run_training).
+        let perm = permutation::<B>(n_train, cfg.seed.wrapping_add(epoch as u64), &device);
+        let x_epoch = x_train.clone().select(0, perm.clone());
+        let y_epoch = y_train.clone().select(0, perm);
         let mut start = 0;
+        let mut tloss = 0.0;
         while start < n_train {
             let end = (start + bs).min(n_train);
-            let xb = x_train.clone().slice([start..end]);
-            let yb = y_train.clone().slice([start..end]);
+            let xb = x_epoch.clone().slice([start..end]);
+            let yb = y_epoch.clone().slice([start..end]);
             let logits = model.forward(xb);
             let loss = loss_fn.forward(logits, yb);
-            let loss_val = loss.clone().into_scalar().elem::<f64>();
+            if end == n_train {
+                tloss = loss.clone().into_scalar().elem::<f64>();
+            }
             let grads = loss.backward();
             let gp = GradientsParams::from_grads(grads, &model);
             model = opt.step(cfg.lr, model, gp);
-            run.log(&[("loss/train", loss_val)], epoch);
             start = end;
         }
 
@@ -976,13 +1016,16 @@ fn run_cnn_training<B: AutodiffBackend>(
 
         let logits = model.forward(x_val.clone());
         let vloss = loss_fn
-            .forward(logits.clone(), to_targets::<B>(&data.val_y, &device))
+            .forward(logits.clone(), y_val.clone())
             .into_scalar()
             .elem::<f64>();
         let preds: Vec<i64> = logits.argmax(1).into_data().iter::<i64>().collect();
         let (cm, correct) = confusion(&preds, &data.val_y, n_classes);
         let acc = correct as f64 / data.val_y.len().max(1) as f64;
-        run.log(&[("loss/val", vloss), ("acc/val", acc)], epoch);
+        run.log(
+            &[("loss/train", tloss), ("loss/val", vloss), ("acc/val", acc)],
+            epoch,
+        );
         if let Some(mb) = mem_probe() {
             run.log(&[("mem/gpu_mb", mb)], epoch);
         }
@@ -1040,12 +1083,17 @@ fn fit_mlp(data: &Prepared, cfg: &TrainCfg, hidden: &[usize]) -> Mlp<Autodiff<Nd
     let loss_fn = CrossEntropyLossConfig::new().init(&device);
     let n = data.train_x.len();
     let bs = cfg.batch_size.max(1);
-    for _ in 0..cfg.epochs {
+    // Same per-epoch reshuffle as run_training so `export` reproduces the
+    // weights a CPU `train` would produce from the same seed.
+    for epoch in 1..=cfg.epochs {
+        let perm = permutation::<B>(n, cfg.seed.wrapping_add(epoch as u64), &device);
+        let x_epoch = x.clone().select(0, perm.clone());
+        let y_epoch = y.clone().select(0, perm);
         let mut start = 0;
         while start < n {
             let end = (start + bs).min(n);
-            let logits = model.forward(x.clone().slice([start..end]));
-            let loss = loss_fn.forward(logits, y.clone().slice([start..end]));
+            let logits = model.forward(x_epoch.clone().slice([start..end]));
+            let loss = loss_fn.forward(logits, y_epoch.clone().slice([start..end]));
             let grads = loss.backward();
             let gp = GradientsParams::from_grads(grads, &model);
             model = opt.step(cfg.lr, model, gp);

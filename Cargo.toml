@@ -1,6 +1,6 @@
 [package]
 name = "nexis-ml-rs"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "Python-free, single-binary ML engine for the Nexis terminal (Phase 3) — same NDJSON protocol and run store as nexis-ml."
 license = "Apache-2.0"
@@ -29,3 +29,8 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 opt-level = 3
 lto = true
 strip = true
+# Whole-program optimization for the shipped single binary (one-time compile
+# cost). Note: `panic = "abort"` is intentionally NOT set — `gpu_available()`
+# uses `catch_unwind` to probe for a wgpu adapter and fall back to CPU, which
+# requires unwinding.
+codegen-units = 1

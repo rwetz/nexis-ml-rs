@@ -10,7 +10,7 @@
 //! either engine with no changes. Non-append writes go through tmp+rename.
 
 use std::fs;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -83,7 +83,10 @@ pub fn now_iso() -> String {
 
 pub struct RunDir {
     pub path: PathBuf,
-    metrics: Option<fs::File>,
+    // Buffered so the per-epoch event burst (metric/artifact/epoch lines)
+    // coalesces into one write instead of a syscall per line; flushed at each
+    // epoch boundary and on finish (see `flush`).
+    metrics: Option<BufWriter<fs::File>>,
 }
 
 impl RunDir {
@@ -109,13 +112,24 @@ impl RunDir {
                 .create(true)
                 .append(true)
                 .open(self.path.join("metrics.jsonl"))
-                .ok();
+                .ok()
+                .map(BufWriter::new);
         }
         if let Some(f) = self.metrics.as_mut() {
             if let Ok(line) = serde_json::to_string(event) {
+                // No per-line flush — durability is forced at epoch/finish
+                // boundaries via `flush`. The live protocol channel is stdout
+                // (the emitter), so consumers don't tail this file mid-epoch.
                 let _ = writeln!(f, "{line}");
-                let _ = f.flush();
             }
+        }
+    }
+
+    /// Flush buffered metric lines to disk. Called at each epoch boundary and
+    /// on finish so a hard kill loses at most the current epoch's events.
+    pub fn flush(&mut self) {
+        if let Some(f) = self.metrics.as_mut() {
+            let _ = f.flush();
         }
     }
 

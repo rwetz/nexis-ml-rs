@@ -6,6 +6,30 @@ This engine speaks the same protocol and writes the same run store as the
 Python [`nexis-ml`](https://github.com/rwetz/nexis-ml) — see
 [PLAN.md](PLAN.md) for the milestone-by-milestone story.
 
+## [0.7.0] — 2026-06-25
+
+### Changed
+- **`device = "auto"` now trains on the CPU backend** instead of preferring
+  wgpu. For the small MLPs and CNN this engine builds, wgpu's per-process
+  init + adapter probe + kernel autotune (seconds) dwarfs the actual
+  training — the default tabular run dropped from ~4.4s to ~0.13s. The GPU is
+  opt-in via `device = "gpu"` (where it pays off only on larger workloads).
+- **Per-epoch row reshuffle** — the training data is reshuffled every epoch
+  (seeded; one on-device gather) for better SGD convergence, instead of a
+  single fixed shuffle. Reproducible from the seed and mirrored in the ONNX
+  export fit, so `export` still matches a CPU `train`.
+
+### Performance
+- The training loop reads the train-loss scalar **once per epoch** (final
+  minibatch) instead of every step; the old per-step `into_scalar()` forced a
+  GPU→CPU sync that serialized the wgpu pipeline. Train loss is now logged
+  per epoch alongside val.
+- `metrics.jsonl` writes are buffered and flushed at epoch/finish boundaries
+  instead of one flush per line; validation targets are hoisted out of the
+  epoch loop.
+- Release builds use `codegen-units = 1` (kept `panic = unwind` for the GPU
+  probe's `catch_unwind` CPU fallback).
+
 ## [0.6.0] — 2026-06-16
 
 ### Added
