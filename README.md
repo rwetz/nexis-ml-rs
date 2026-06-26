@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/nexis-icon.png" alt="Nexis" width="120" height="120">
+</p>
+
 # nexis-ml-rs
 
 A **Python-free, single-binary** ML engine for the [Nexis](https://github.com/rwetz/Nexis)
